@@ -114,6 +114,9 @@ def _verify_block(lm: Any, verify_input: mx.array, prompt_cache: list[Any], rope
     rollback needs. Greedy targets come from the fused argmax, like mlx-vlm's own loop."""
     # speculative_verify: mlx-vlm 0.6.16 routes the block through its exact verifier (the
     # same call as its speculative_verify_hidden), instead of a flag on the attention layers.
+    # speculative_verify: mlx-vlm 0.6.16 routes the block through its exact verifier (the same
+    # call as its speculative_verify_hidden); the plain forward no longer returns the gdn_states
+    # the rollback needs, so this is the only verify path.
     kwargs = dict(cache=prompt_cache, capture_layer_ids=[], return_hidden=True,
                   return_shared_kv=True, skip_logits=True, speculative_verify=True)
     if rope_deltas is not None:
