@@ -204,3 +204,22 @@ def test_verify_block_attention_hides_each_rows_left_padding_in_a_batch_cache():
     out = verify_block_attention(queries, keys, values, cache=cache, scale=scale, mask=None)
     for row, (pad, ref) in enumerate(zip(pads, refs)):
         assert mx.allclose(out[row : row + 1], ref, atol=1e-3, rtol=1e-3).item(), f"row {row} (pad {pad})"
+
+
+def test_the_patched_left_padded_attention_only_takes_over_quantized_verify_blocks():
+    """mlx-vlm 0.6.16's exact verifier asks the language module's helper first; dense caches
+    and single tokens must still reach the original."""
+    from mlx_engine.model_kit.patches import qwen3_5 as patches
+
+    calls = []
+    original = patches.OriginalVlmQwen3_5LeftPaddedAttention
+    patches.OriginalVlmQwen3_5LeftPaddedAttention = lambda *a, **k: calls.append("original") or None
+    try:
+        q = mx.zeros((1, 2, 3, 8))
+        assert patches._patched_vlm_qwen3_5_left_padded_attention(q, q, q, cache=KVCache(), scale=1.0, mask=None) is None
+        one = mx.zeros((1, 2, 1, 8))
+        quantized = QuantizedKVCache(group_size=64, bits=8)
+        assert patches._patched_vlm_qwen3_5_left_padded_attention(one, one, one, cache=quantized, scale=1.0, mask=None) is None
+        assert calls == ["original", "original"]
+    finally:
+        patches.OriginalVlmQwen3_5LeftPaddedAttention = original

@@ -37,6 +37,7 @@ from mlx_lm.models.gated_delta import gated_delta_update
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.qwen3_next import Qwen3NextAttention
 from mlx_vlm.models.base import LanguageModelOutput
+from mlx_engine.model_kit.batched_vision.kv_quant import verify_block_attention
 from mlx_vlm.models.qwen3_5 import language as vlm_qwen3_5_language
 from mlx_vlm.models.qwen3_5.language import (
     LanguageModel as VlmQwen3_5LanguageModel,
@@ -60,6 +61,27 @@ OriginalVlmQwen3_5IsSingleRowBatchCache = (
 OriginalVlmQwen3_5RaggedDecodeAttention = (
     vlm_qwen3_5_language._qwen3_5_ragged_decode_attention
 )
+OriginalVlmQwen3_5LeftPaddedAttention = (
+    vlm_qwen3_5_language._qwen3_5_left_padded_attention
+)
+
+
+def _patched_vlm_qwen3_5_left_padded_attention(
+    queries, keys, values, *, cache, scale, mask
+):
+    """Speculative verify on a quantized KV cache (lmk: speculative_decoding with
+    kv_cache_bits 8). mlx-vlm's exact verifier asks this helper first and, when it
+    returns None (it does for every quantized cache), slices dense keys position by
+    position — which a quantized cache does not have (its keys are (packed, scales,
+    biases) tuples). The block is attended in one masked quantized call instead; a
+    dense cache, or a single token, takes the original path unchanged."""
+    if hasattr(cache, "bits") and queries.ndim == 4 and queries.shape[2] > 1:
+        return verify_block_attention(
+            queries, keys, values, cache=cache, scale=scale, mask=mask
+        )
+    return OriginalVlmQwen3_5LeftPaddedAttention(
+        queries, keys, values, cache=cache, scale=scale, mask=mask
+    )
 
 
 def _patched_vlm_qwen3_5_ragged_decode_attention(*args, **kwargs):
@@ -717,4 +739,8 @@ def apply_patches():
     )
     vlm_qwen3_5_language._qwen3_5_ragged_decode_attention = (
         _patched_vlm_qwen3_5_ragged_decode_attention
+    )
+    # the exact verifier looks this helper up on the language module at call time
+    vlm_qwen3_5_language._qwen3_5_left_padded_attention = (
+        _patched_vlm_qwen3_5_left_padded_attention
     )
