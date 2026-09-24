@@ -49,6 +49,13 @@ class GenerationRequest:
 
 
 @dataclass
+class ReplaceDrafterRequest:
+    """Hand a (possibly None) speculative drafter to the generation thread."""
+
+    drafter: object
+
+
+@dataclass
 class CancelGenerationRequest:
     """
     Internal request object for cancelling a generation request.

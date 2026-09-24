@@ -17,6 +17,7 @@ from transformers.image_utils import ChannelDimension
 from mlx_engine.model_kit.batched_model_kit_types import (
     BatchedGenerationResponse,
     CancelGenerationRequest,
+    ReplaceDrafterRequest,
     RequestCancelled,
 )
 from mlx_engine.model_kit.batched_vision.batch_generator import (
@@ -117,8 +118,9 @@ class BatchedVisionModelKit:
     both text-only and basic image requests.
     """
 
-    # A class attribute: tests build instances without __init__.
+    # Class attributes: tests build instances without __init__.
     _kv_quant: KVQuantParams | None = None
+    _drafter = None
 
     model = None
     processor = None
@@ -316,9 +318,15 @@ class BatchedVisionModelKit:
         max_tokens: int,
         sampler: Callable[[mx.array], mx.array],
         logits_processors: list,
+        speculative_decoding_toggle: bool | None = None,
+        num_draft_tokens: int | None = None,
     ):
         if self._shutdown.is_set():
             raise RuntimeError("Cannot accept new requests when model is shutdown")
+        if speculative_decoding_toggle and self._drafter is None:
+            raise ValueError(
+                "Speculative decoding toggle is explicitly enabled but no draft model is loaded"
+            )
         if isinstance(self._backend_exception, Exception):
             raise self._backend_exception
 
@@ -333,6 +341,8 @@ class BatchedVisionModelKit:
                 logits_processors=logits_processors,
                 top_logprobs=top_logprobs,
                 max_tokens=max_tokens,
+                speculative=speculative_decoding_toggle is not False,
+                draft_tokens=num_draft_tokens,
             )
         )
 
@@ -400,17 +410,32 @@ class BatchedVisionModelKit:
         return self._shutdown.is_set()
 
     def is_draft_model_compatible(self, path: str | Path) -> bool:
-        return False
+        from mlx_engine.model_kit.batched_vision.speculative import drafter_problem
+
+        return drafter_problem(path, self.config) is None
 
     def load_draft_model(self, path: str | Path) -> None:
-        raise ValueError(
-            "Speculative decoding is not currently supported for batched vision models"
-        )
+        """Load a native MTP drafter; every later request is drafted unless it opts out."""
+        from mlx_engine.model_kit.batched_vision.speculative import load_mtp_drafter
+
+        if self.model is None:
+            raise ValueError("Main model must be loaded before loading a draft model")
+        logger.info(f"Loading draft model from {path}...")
+        self._drafter = load_mtp_drafter(path, self.model, self.config)
+        self._requests.put(ReplaceDrafterRequest(self._drafter))
+        logger.info("Draft model loaded")
 
     def unload_draft_model(self) -> None:
-        raise ValueError(
-            "Speculative decoding is not currently supported for batched vision models"
-        )
+        if self._drafter is None:
+            logger.info("No loaded draft model to unload")
+            return
+        self._drafter = None
+        self._requests.put(ReplaceDrafterRequest(None))
+        mx.clear_cache()
+
+    @property
+    def draft_model(self):
+        return None if self._drafter is None else self._drafter.model
 
     def _generate_with_exception_handling(self):
         try:
@@ -444,6 +469,7 @@ class BatchedVisionModelKit:
             # internal batcher default here.
             completion_batch_size=self._max_seq_nums,
             kv_quant=self._kv_quant,
+            drafter=self._drafter,
             prefill_step_size=(
                 None
                 if _requires_global_no_chunked_prefill(
@@ -597,6 +623,8 @@ class BatchedVisionModelKit:
             next_prefix_cache_chunk_idx=next_prefix_cache_chunk_idx,
             image_spans=prepared_prompt.image_spans,
             prompt_cache_save_callback=prompt_cache_save_callback,
+            speculative=getattr(request, "speculative", True),
+            draft_tokens=getattr(request, "draft_tokens", None),
         )
 
         active[uid] = ActiveRequest(

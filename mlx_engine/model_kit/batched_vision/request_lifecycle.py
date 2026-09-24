@@ -7,6 +7,7 @@ from typing import Any, Callable
 import mlx.core as mx
 from mlx_engine.model_kit.batched_model_kit_types import (
     CancelGenerationRequest,
+    ReplaceDrafterRequest,
     RequestCancelled,
 )
 from mlx_engine.model_kit.batched_vision.batch_generator import (
@@ -32,6 +33,8 @@ class GenerationRequest:
     logits_processors: list
     top_logprobs: int
     max_tokens: int
+    speculative: bool = True
+    draft_tokens: int | None = None
 
 
 @dataclass
@@ -160,6 +163,9 @@ class GenerationThreadController:
             if isinstance(item, CancelGenerationRequest):
                 if not self.cancel_request(item.request_id):
                     logger.warning(f"Could not cancel request_id={item.request_id}")
+                continue
+            if isinstance(item, ReplaceDrafterRequest):
+                self.state.batch_generator.set_drafter(item.drafter)
                 continue
 
             if isinstance(item, (PreparedInsert, FailedRestore)):

@@ -53,9 +53,24 @@ def is_quantized_kv_cache(cache: Any) -> bool:
     return type(cache).__name__ == "QuantizedKVCache"
 
 
+class TrimmableBatchQuantizedKVCache(BatchQuantizedKVCache):
+    """mlx-vlm's batch quantized cache reports itself untrimmable, which makes
+    speculative rollback mistake it for an SSM state. Trimming is only index
+    bookkeeping, exactly as in BatchKVCache.trim."""
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, int(n))
+        self._idx -= n
+        self.offset = self.offset - n
+        return n
+
+
 def batch_from_scalar_quantized(cache: QuantizedKVCache) -> BatchQuantizedKVCache:
     """The BatchKVCache.merge([cache]) equivalent for one quantized cache."""
-    batch_cache = BatchQuantizedKVCache(
+    batch_cache = TrimmableBatchQuantizedKVCache(
         [0], group_size=cache.group_size, bits=cache.bits
     )
     if cache.keys is None or cache.offset == 0:

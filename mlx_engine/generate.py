@@ -789,6 +789,8 @@ def _batched_generation(
             top_logprobs=top_logprobs,
             sampler=sampler,
             logits_processors=logits_processors,
+            speculative_decoding_toggle=speculative_decoding_toggle,
+            num_draft_tokens=num_draft_tokens,
         )
     else:
         prompt_progress_callback = BatchedMlxLmReporterAdapter(

@@ -75,6 +75,8 @@ class _GenerationRow:
     tokens: list[int]
     prefix_cache_save_state: _PrefixCacheSaveState
     num_tokens: int = 0
+    speculative: bool = True          # False: this request asked for no speculative decoding
+    draft_tokens: Optional[int] = None  # this request's tokens drafted per round; None = the drafter's own
 
 
 @dataclass
@@ -92,6 +94,8 @@ class _PendingSequence:
     rope_deltas: Any | None
     prompt_kwargs: dict
     prefix_cache_save_state: _PrefixCacheSaveState
+    speculative: bool = True
+    draft_tokens: Optional[int] = None
 
 
 def _batch_single_cache(cache: list[Any]) -> list[Any]:
@@ -454,7 +458,32 @@ class GenerationBatch:
         prev_top_idx = self._next_top_idx
         prev_top_logprobs = self._next_top_logprobs
         inputs = self._current_tokens
+        row_tokens = [row.tokens for row in self._rows]
+        row_token_lens = [len(tokens) for tokens in row_tokens]
+        self._advance(inputs)
 
+        tokens, token_logprob_list, top_idx_list, top_logprob_list = (
+            _materialize_step_outputs(
+                inputs,
+                self._current_token_logprobs,
+                prev_top_idx,
+                prev_top_logprobs,
+            )
+        )
+
+        for seq_tokens, token, old_len in zip(row_tokens, tokens, row_token_lens):
+            if len(seq_tokens) == old_len:
+                seq_tokens.append(token)
+        return tokens, token_logprob_list, top_idx_list, top_logprob_list
+
+    def _forward_logits(self, inputs: mx.array, fwd_kwargs: dict) -> mx.array:
+        """One decode forward for the batch: the last-position logits."""
+        output = self.model(inputs[:, None], cache=self.prompt_cache, **fwd_kwargs)
+        logits = output.logits if hasattr(output, "logits") else output
+        return logits[:, -1, :]
+
+    def _advance(self, inputs: mx.array) -> None:
+        """Feed one token per row and sample the next (kept as _next_*, not emitted)."""
         fwd_kwargs = {}
         if self._rope_deltas is not None:
             # Same handoff as external/src/mlx-vlm/mlx_vlm/generate.py:
@@ -464,13 +493,9 @@ class GenerationBatch:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
             _sync_scalar_rope_deltas(self.model, self.prompt_cache, self._rope_deltas)
         fwd_kwargs = _with_logits_to_keep(self.model, fwd_kwargs)
-
-        output = self.model(inputs[:, None], cache=self.prompt_cache, **fwd_kwargs)
-        logits = output.logits if hasattr(output, "logits") else output
-        logits = logits[:, -1, :]
+        logits = self._forward_logits(inputs, fwd_kwargs)
 
         row_tokens = [row.tokens for row in self._rows]
-        row_token_lens = [len(tokens) for tokens in row_tokens]
         row_logits_processors = [row.logits_processors for row in self._rows]
         if any(row_logits_processors):
             logits = _apply_logits_processors(
@@ -496,20 +521,6 @@ class GenerationBatch:
         if top_idx is not None:
             eval_targets.extend([top_idx, top_logprobs])
         mx.async_eval(*eval_targets)
-
-        tokens, token_logprob_list, top_idx_list, top_logprob_list = (
-            _materialize_step_outputs(
-                inputs,
-                self._current_token_logprobs,
-                prev_top_idx,
-                prev_top_logprobs,
-            )
-        )
-
-        for seq_tokens, token, old_len in zip(row_tokens, tokens, row_token_lens):
-            if len(seq_tokens) == old_len:
-                seq_tokens.append(token)
-        return tokens, token_logprob_list, top_idx_list, top_logprob_list
 
     def extract_cache(self, idx: int) -> list[Any] | None:
         if idx == 0 and _is_scalar_prompt_cache(self.prompt_cache):
@@ -783,9 +794,16 @@ class _PromptPrefill:
         all_tokens: Optional[list[int]] = None,
         rope_deltas: Any | None = None,
         kv_quant: Optional[KVQuantParams] = None,
+        speculative: bool = True,
+        draft_tokens: Optional[int] = None,
+        want_hidden: bool = False,
     ):
         self.model = model
         self.uid = uid
+        self.speculative = speculative
+        self.draft_tokens = draft_tokens
+        # A drafter needs the hidden state that predicted the first token.
+        self.want_hidden = want_hidden
         self.max_tokens = max_tokens
         self.top_logprobs = top_logprobs
         self.sampler = sampler
@@ -1017,6 +1035,8 @@ class _PromptPrefill:
         prompt_kwargs = _with_logits_to_keep(
             self.model, self._prompt_kwargs_for_final()
         )
+        if self.want_hidden:
+            prompt_kwargs["return_hidden"] = True
         _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
         try:
             output = self.model(
@@ -1027,6 +1047,9 @@ class _PromptPrefill:
             )
         finally:
             _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
+        last_hidden = None
+        if self.want_hidden and getattr(output, "hidden_states", None):
+            last_hidden = output.hidden_states[-1][:, -1:, :]
         self._processed_prefix_len = len(self._all_tokens) + len(self._prompt_token_ids)
         self._emit_cache_save_snapshots()
         prompt_responses = self.progress_responses()
@@ -1060,6 +1083,9 @@ class _PromptPrefill:
         gen_batch._next_token_logprobs = first_logprobs
         gen_batch._next_top_idx = top_idx
         gen_batch._next_top_logprobs = top_logprobs
+        gen_batch._next_hidden = last_hidden
+        gen_batch._rows[0].speculative = self.speculative
+        gen_batch._rows[0].draft_tokens = self.draft_tokens
 
         # Request-owned MRoPE state is authoritative. Older model families may
         # still expose only the language-model side state, so retain that fallback.
@@ -1080,6 +1106,8 @@ class _PromptPrefill:
             eval_targets.extend([top_idx, top_logprobs])
         if rope_deltas is not None:
             eval_targets.append(rope_deltas)
+        if last_hidden is not None:
+            eval_targets.append(last_hidden)
         mx.eval(*eval_targets)
 
         self.prompt_cache = []
@@ -1139,9 +1167,11 @@ class BatchGenerator:
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         top_logprobs_k: int = 0,
         kv_quant: Optional[KVQuantParams] = None,
+        drafter: Any = None,
     ):
         self.model = model
         self.kv_quant = kv_quant
+        self.drafter = drafter
         self.max_tokens = max_tokens
         self._default_top_logprobs = top_logprobs_k
         self.stop_criteria = stop_criteria
@@ -1156,9 +1186,31 @@ class BatchGenerator:
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model))
-        self._generation_batch = GenerationBatch.empty(
-            self.model,
-            self.stop_criteria,
+        self._generation_batch = self._empty_generation_batch()
+
+    def set_drafter(self, drafter: Any) -> None:
+        """Switch drafting on/off. Takes effect once the decode batch is empty."""
+        self.drafter = drafter
+        self._pending_drafter_switch = True
+        self._apply_drafter_switch()
+
+    def _apply_drafter_switch(self) -> None:
+        if not getattr(self, "_pending_drafter_switch", False):
+            return
+        if len(self._generation_batch) > 0:
+            return
+        self._generation_batch = self._empty_generation_batch()
+        self._pending_drafter_switch = False
+
+    def _empty_generation_batch(self) -> GenerationBatch:
+        if self.drafter is None:
+            return GenerationBatch.empty(self.model, self.stop_criteria)
+        from mlx_engine.model_kit.batched_vision.speculative import (
+            SpeculativeGenerationBatch,
+        )
+
+        return SpeculativeGenerationBatch.empty(
+            self.model, self.stop_criteria, drafter=self.drafter
         )
 
     def close(self):
@@ -1187,6 +1239,8 @@ class BatchGenerator:
         rope_deltas: Any | None = None,
         next_prefix_cache_chunk_idx: int,
         prompt_cache_save_callback: Optional[PromptCacheSaveCallback] = None,
+        speculative: bool = True,
+        draft_tokens: Optional[int] = None,
     ) -> int:
         uid = self.uid_count
         self.uid_count += 1
@@ -1213,6 +1267,8 @@ class BatchGenerator:
                     image_spans=list(image_spans),
                     callback=prompt_cache_save_callback,
                 ),
+                speculative=speculative,
+                draft_tokens=draft_tokens,
             )
         )
         return uid
@@ -1243,6 +1299,7 @@ class BatchGenerator:
     def _next(self):
         generation_responses = []
         prompt_responses = []
+        self._apply_drafter_switch()
 
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
@@ -1289,6 +1346,9 @@ class BatchGenerator:
                 all_tokens=sequence.all_tokens,
                 rope_deltas=sequence.rope_deltas,
                 kv_quant=self.kv_quant,
+                speculative=sequence.speculative,
+                draft_tokens=sequence.draft_tokens,
+                want_hidden=self.drafter is not None,
             )
 
             if self._prompt_batch.needs_processing():
