@@ -417,10 +417,14 @@ class SpeculativeGenerationBatch(GenerationBatch):
                 keep.append(idx)
                 continue
             token = tokens[idx]
+            # The snapshot goes out before the token joins row.tokens: this token was sampled
+            # but not fed, so the cache does not hold it yet. The plain path keeps row.tokens
+            # = fed tokens (decode-ahead); a snapshot taken one token early made the store skip
+            # the chunk ("kv cache snapshot covers [0, 255), not [0, 256)").
+            self._emit_cache_save_snapshot(idx)
             row.tokens.append(token)
             row.num_tokens += 1
             reason = self._finish_reason(row, token)
-            self._emit_cache_save_snapshot(idx)
             responses.append(self._response(idx, row, token, reason))
             if reason is None:
                 keep.append(idx)
@@ -470,11 +474,15 @@ class SpeculativeGenerationBatch(GenerationBatch):
         for idx, row in enumerate(rows):
             tokens, reason = result.new_tokens[idx], result.finish[idx]
             for n, token in enumerate(tokens):
+                last = n == len(tokens) - 1
+                if last:
+                    # everything before the last token was fed to the target in the verify pass;
+                    # the last one is the next bonus, not in the cache yet — snapshot before it
+                    # joins row.tokens (see _emit_pending)
+                    self._emit_cache_save_snapshot(idx)
                 row.tokens.append(token)
                 row.num_tokens += 1
-                last = n == len(tokens) - 1
                 responses.append(self._response(idx, row, token, reason if last else None))
-            self._emit_cache_save_snapshot(idx)
             if reason is None:
                 keep.append(idx)
         self._bonus = [tokens[-1] for tokens in result.new_tokens]

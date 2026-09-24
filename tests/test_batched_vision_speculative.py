@@ -80,13 +80,16 @@ class _Round:
                                        hidden=mx.ones((len(bonus), 1, H)), accepted=[len(t) - 1 for t in new_tokens])
 
 
-def _batch(model, rows, *, stop=frozenset(), max_tokens=100, top_logprobs=0, speculative_rows=None, pending=True):
+def _batch(model, rows, *, stop=frozenset(), max_tokens=100, top_logprobs=0, speculative_rows=None, pending=True,
+           all_tokens=None, save_callback=None):
     drafter = Drafter(model=_DraftModel(), kind="mtp", block_size=3)
     batch = SpeculativeGenerationBatch(
         model=model, uids=list(range(10, 10 + rows)), inputs=mx.array([5] * rows, dtype=mx.int32),
         prompt_cache=[_Cache()], samplers=[_argmax] * rows, stop_criteria=lambda t: t in stop,
-        max_tokens=[max_tokens] * rows, top_logprobs=[top_logprobs] * rows, all_tokens=[[1]] * rows,
-        logits_processors=[[]] * rows, prefix_cache_save_states=[_PrefixCacheSaveState([], 0, [], None)] * rows,
+        max_tokens=[max_tokens] * rows, top_logprobs=[top_logprobs] * rows,
+        all_tokens=[list(t) for t in (all_tokens or [[1]] * rows)],
+        logits_processors=[[]] * rows,
+        prefix_cache_save_states=[_PrefixCacheSaveState([], 0, [], save_callback) for _ in range(rows)],
         drafter=drafter,
     )
     batch._hidden = mx.zeros((rows, 1, H))
@@ -209,3 +212,22 @@ def test_drafter_problem_reads_only_configs(tmp_path):
     (tmp_path / "config.json").write_text('{"model_type": "dflash"}')
     assert "not supported" in speculative.drafter_problem(tmp_path, target)
     assert "config.json" in speculative.drafter_problem(tmp_path / "missing", target)
+
+
+def test_a_cache_snapshot_never_counts_the_token_that_is_not_in_the_cache_yet(monkeypatch):
+    """A round's last token (the next bonus) and a pending token are sampled but not fed; the plain
+    path keeps row.tokens = fed tokens, so a snapshot taken with the unfed token counted came one
+    token short and the store skipped the chunk: 'kv cache snapshot covers [0, 255), not [0, 256)'
+    (lmk, 2026-09-24, on every greedy code answer that landed exactly on 256)."""
+    fake = _Round([[[7, 8, 9]], [[10]]])
+    monkeypatch.setattr(speculative, "speculative_round", fake)
+    seen = []
+    batch = _batch(_Model(), 1, all_tokens=[[1] * 252],
+                   save_callback=lambda cache, chunks, start, end, length: seen.append((length, start, end)))
+
+    batch.next()      # pending 5 goes out (253 fed), then the round emits 7, 8, 9: 256 counted, 255 fed
+    assert batch._rows[0].tokens == [1] * 252 + [5, 7, 8, 9]
+    assert seen == []                                  # 9 is not in the cache: no snapshot at 256 yet
+    batch.next()      # the next round feeds 9 in its verify pass, emits 10
+    assert seen == [(256, 0, 1)]                       # now the chunk [0, 256) is fully in the cache
+    assert batch._rows[0].tokens == [1] * 252 + [5, 7, 8, 9, 10]
