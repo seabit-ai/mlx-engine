@@ -415,8 +415,9 @@ class BatchedVisionModelKit:
         return drafter_problem(path, self.config) is None
 
     def load_draft_model(self, path: str | Path) -> None:
-        """Load a native MTP drafter; every later request is drafted unless it opts out."""
-        from mlx_engine.model_kit.batched_vision.speculative import load_mtp_drafter
+        """Load a drafter (the model's MTP head, or a DFlash drafter); every later request is
+        drafted unless it opts out."""
+        from mlx_engine.model_kit.batched_vision.speculative import load_drafter_for as load_mtp_drafter
 
         if self.model is None:
             raise ValueError("Main model must be loaded before loading a draft model")

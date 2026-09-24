@@ -231,3 +231,106 @@ def test_a_cache_snapshot_never_counts_the_token_that_is_not_in_the_cache_yet(mo
     batch.next()      # the next round feeds 9 in its verify pass, emits 10
     assert seen == [(256, 0, 1)]                       # now the chunk [0, 256) is fully in the cache
     assert batch._rows[0].tokens == [1] * 252 + [5, 7, 8, 9, 10]
+
+
+# ---- the DFlash kind: one row, a separate drafter with its own cache, verified in one plain forward
+
+class _DFlashConfig:
+    block_size = 4
+    target_layer_ids = [0]
+    sliding_window = 16
+
+
+class _DFlashDraft:
+    """Stands in for a DFlash draft model: scripted draft blocks, its own cache from reset()."""
+    config = _DFlashConfig()
+    dflash_initial_block_size = None
+    prefer_requested_block_size = True
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.accept_lens, self.draft_lens = [], []
+        self.speculative_total_rounds = 0
+        self.speculative_total_accepted = 0.0
+        self.speculative_total_drafted = 0
+
+    def reset(self, model):
+        self.calls.append("reset")
+        return ["draft-cache"]
+
+    def draft_block(self, bonus, context, cache, block_size, sampler, dtype):
+        self.calls.append(("draft", bonus, context.shape, block_size))
+        return mx.array([self.script.pop(0)[: block_size - 1]], dtype=dtype)
+
+
+class _DFlashModel(_Model):
+    """The target: a verify forward returns per-position logits whose argmax is scripted, and
+    captured hidden states; the rollback is recorded."""
+
+    def __init__(self, target_script):
+        super().__init__()
+        self.targets = list(target_script)
+        self.rollbacks = []
+
+    def __call__(self, input_ids, cache=None, **kwargs):
+        self.calls.append({"input_ids": input_ids.tolist(), "capture": kwargs.get("capture_layer_ids")})
+        b, n = input_ids.shape
+        out = SimpleNamespace(hidden_states=[mx.ones((b, n, H)) * 3])
+        if n > 1 and self.targets:                      # a verify block
+            target = self.targets.pop(0)
+            out.logits = mx.array([[[1.0 if j == t else 0.0 for j in range(16)] for t in target[:n]]] * b)
+        else:
+            out.logits = mx.zeros((b, n, 16))
+        return out
+
+    def rollback_speculative_cache(self, cache, gdn_states, accepted, block_size):
+        self.rollbacks.append((accepted, block_size, len(gdn_states)))
+        return accepted
+
+
+def _dflash_batch(model, draft, all_tokens=None, ctx_tokens=3):
+    drafter = Drafter(model=draft, kind="dflash", block_size=4, target_layer_ids=(0,), window=16)
+    batch = SpeculativeGenerationBatch(
+        model=model, uids=[10], inputs=mx.array([5], dtype=mx.int32), prompt_cache=[_Cache()], samplers=[_argmax],
+        stop_criteria=lambda t: t == 2, max_tokens=[100], top_logprobs=[0], all_tokens=[list(all_tokens or [1])],
+        logits_processors=[[]], prefix_cache_save_states=[_PrefixCacheSaveState([], 0, [], None)], drafter=drafter,
+    )
+    batch._hidden = mx.zeros((1, ctx_tokens, H))   # the prompt tail's captured states, as prefill hands them over
+    return batch
+
+
+def test_a_dflash_round_drafts_from_the_context_verifies_in_one_forward_and_keeps_the_accepted_states():
+    draft = _DFlashDraft([[7, 8, 9]])
+    model = _DFlashModel([[7, 8, 4, 6]])   # the target agrees with 7 and 8, then says 4 where the draft said 9
+    batch = _dflash_batch(model, draft)
+
+    responses = batch.next()
+
+    assert [r.token for r in responses] == [5, 7, 8, 4]
+    assert draft.calls == ["reset", ("draft", 5, (1, 3, H), 4)]         # the drafter saw the 3-token prompt tail
+    verify = [c for c in model.calls if len(c["input_ids"][0]) > 1]
+    assert verify == [{"input_ids": [[5, 7, 8, 9]], "capture": [0]}]     # bonus + drafts, captured layers requested
+    assert model.rollbacks == [(2, 4, 0)]                                # two drafts accepted: roll the block's tail back
+    assert batch._hidden.shape == (1, 3, H)                              # the accepted part of the block, for the next round
+    assert batch._bonus == [4] and batch._pending == [False]
+    assert draft.speculative_total_accepted == 2 and draft.speculative_total_drafted == 3
+    assert batch._rows[0].tokens == [1, 5, 7, 8, 4] and batch._rows[0].num_tokens == 4
+
+
+def test_a_dflash_round_that_accepts_everything_does_not_roll_back():
+    draft = _DFlashDraft([[7, 8, 9]])
+    model = _DFlashModel([[7, 8, 9, 3]])
+    batch = _dflash_batch(model, draft)
+    responses = batch.next()
+    assert [r.token for r in responses] == [5, 7, 8, 9, 3]
+    assert model.rollbacks == [] and batch._hidden.shape == (1, 4, H)
+
+
+def test_a_plain_tick_appends_the_fed_token_to_a_dflash_context():
+    draft = _DFlashDraft([])
+    model = _DFlashModel([])
+    batch = _dflash_batch(model, draft, ctx_tokens=2)
+    batch._rows[0].top_logprobs = 1            # anything that forces a plain step
+    batch.next()
+    assert batch._hidden.shape == (1, 3, H)    # 2 prompt-tail states + the token the plain step fed

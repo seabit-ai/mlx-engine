@@ -797,13 +797,18 @@ class _PromptPrefill:
         speculative: bool = True,
         draft_tokens: Optional[int] = None,
         want_hidden: bool = False,
+        drafter: Any = None,
     ):
         self.model = model
         self.uid = uid
         self.speculative = speculative
         self.draft_tokens = draft_tokens
-        # A drafter needs the hidden state that predicted the first token.
-        self.want_hidden = want_hidden
+        # A drafter needs target states from the prompt: an MTP head the last layer's state of
+        # the token that predicted the first token; a DFlash drafter a few layers' states for the
+        # prompt's tail (its window), gathered chunk by chunk.
+        self.drafter = drafter
+        self.want_hidden = want_hidden or drafter is not None
+        self._ctx_hidden: Optional[mx.array] = None
         self.max_tokens = max_tokens
         self.top_logprobs = top_logprobs
         self.sampler = sampler
@@ -854,8 +859,11 @@ class _PromptPrefill:
         # Prompt kwargs with explicit MRoPE state belong to an image prompt; otherwise
         # this text-only chunk must not inherit state from the active decode batch.
         _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
+        dflash = self.drafter is not None and getattr(self.drafter, "is_dflash", False)
+        if dflash:
+            prompt_kwargs.update(self.drafter.capture_kwargs())
         try:
-            self.model(
+            output = self.model(
                 self._input_ids[:, :n],
                 cache=self.prompt_cache,
                 inputs_embeds=self._inputs_embeds[:, :n],
@@ -863,6 +871,8 @@ class _PromptPrefill:
             )
         finally:
             _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
+        if dflash:
+            self._keep_context_tail(self.drafter.hidden_from(output))
         mx.eval([c.state for c in self.prompt_cache])
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
@@ -984,6 +994,15 @@ class _PromptPrefill:
 
         return proposed_step
 
+    def _keep_context_tail(self, hidden: Optional[mx.array]) -> None:
+        """dflash: the last `window` prompt tokens' captured states, accumulated over chunks."""
+        if hidden is None:
+            return
+        window = max(1, int(getattr(self.drafter, "window", 0) or 0)) if self.drafter is not None else 1
+        joined = hidden if self._ctx_hidden is None else mx.concatenate([self._ctx_hidden, hidden], axis=1)
+        self._ctx_hidden = joined[:, -window:, :]
+        mx.eval(self._ctx_hidden)
+
     def _prompt_kwargs_for_next(self, n: int) -> dict:
         # Slice locally instead of relying on model-specific n_to_process hacks.
         prompt_kwargs = slice_prompt_kwargs(
@@ -1035,7 +1054,10 @@ class _PromptPrefill:
         prompt_kwargs = _with_logits_to_keep(
             self.model, self._prompt_kwargs_for_final()
         )
-        if self.want_hidden:
+        dflash = self.drafter is not None and getattr(self.drafter, "is_dflash", False)
+        if dflash:
+            prompt_kwargs.update(self.drafter.capture_kwargs())
+        elif self.want_hidden:
             prompt_kwargs["return_hidden"] = True
         _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
         try:
@@ -1048,7 +1070,10 @@ class _PromptPrefill:
         finally:
             _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
         last_hidden = None
-        if self.want_hidden and getattr(output, "hidden_states", None):
+        if dflash:
+            self._keep_context_tail(self.drafter.hidden_from(output))
+            last_hidden = self._ctx_hidden
+        elif self.want_hidden and getattr(output, "hidden_states", None):
             last_hidden = output.hidden_states[-1][:, -1:, :]
         self._processed_prefix_len = len(self._all_tokens) + len(self._prompt_token_ids)
         self._emit_cache_save_snapshots()
@@ -1349,6 +1374,7 @@ class BatchGenerator:
                 speculative=sequence.speculative,
                 draft_tokens=sequence.draft_tokens,
                 want_hidden=self.drafter is not None,
+                drafter=self.drafter,
             )
 
             if self._prompt_batch.needs_processing():

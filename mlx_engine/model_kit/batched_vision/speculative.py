@@ -21,6 +21,8 @@ from typing import Any, Callable, Optional
 import mlx.core as mx
 from mlx_vlm.speculative import mtp as _mtp
 from mlx_vlm.speculative.common import _record_speculative_round, generation_stream
+from mlx_vlm.speculative.common import _dflash_block_total, _record_speculative_round, _speculative_walk
+from mlx_vlm.speculative.dflash import _dflash_next_block_size, _sample_dflash_target_walk
 from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
 from mlx_engine.model_kit.patches.qwen3_5 import GdnVerifyRecorder, mark_gdn_convs_for_verify_recording
@@ -34,15 +36,42 @@ from mlx_engine.model_kit.batched_vision.batch_generator import (
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_DRAFTER_MODEL_TYPES = ("qwen3_5_mtp",)
+MTP_MODEL_TYPES = ("qwen3_5_mtp",)
+DFLASH_MODEL_TYPES = ("dflash2", "qwen3_dflash")
+SUPPORTED_DRAFTER_MODEL_TYPES = MTP_MODEL_TYPES + DFLASH_MODEL_TYPES
 TOKEN_DTYPE = mx.int32
 
 
 @dataclass
 class Drafter:
+    """Two kinds. `mtp`: the model's own multi-token-prediction head, drafting from the last
+    layer's hidden state of the token that predicted the bonus. `dflash`: a separate block-
+    diffusion drafter (z-lab's DFlash 2) that conditions on the target's hidden states from a
+    few layers (`target_layer_ids`), injected into its own sliding-window KV cache; it needs
+    those states for the context it has seen — the prompt tail this request prefilled and every
+    token verified since (research exp09: the tail is enough, a restored prefix can go without)."""
     model: Any
     kind: str
     block_size: int  # tokens verified per round, the bonus token included
+    target_layer_ids: tuple = ()   # dflash: which target layers feed the drafter
+    window: int = 0                # dflash: the drafter's sliding window, in tokens
+
+    @property
+    def is_dflash(self) -> bool:
+        return self.kind == "dflash"
+
+    def capture_kwargs(self) -> dict:
+        """What a target forward must return for this drafter to draft from it."""
+        if self.is_dflash:
+            return {"capture_layer_ids": list(self.target_layer_ids)}
+        return {"return_hidden": True}
+
+    def hidden_from(self, output: Any) -> Optional[mx.array]:
+        """The drafter's view of a forward's output: [rows, tokens, dim]."""
+        states = getattr(output, "hidden_states", None)
+        if not states:
+            return None
+        return mx.concatenate(list(states), axis=-1) if self.is_dflash else states[-1]
 
     @property
     def rounds(self) -> int:
@@ -73,7 +102,8 @@ def drafter_problem(path: str | Path, target_config: dict) -> Optional[str]:
             f"drafter model_type {model_type!r} is not supported "
             f"(supported: {', '.join(SUPPORTED_DRAFTER_MODEL_TYPES)})"
         )
-    draft_text = config.get("text_config") or {}
+    # an MTP head carries the target's text_config; a DFlash drafter's own config has hidden_size
+    draft_text = config.get("text_config") or config
     target_text = target_config.get("text_config") or target_config
     for key in ("hidden_size", "vocab_size"):
         mine, theirs = draft_text.get(key), target_text.get(key)
@@ -82,14 +112,23 @@ def drafter_problem(path: str | Path, target_config: dict) -> Optional[str]:
     return None
 
 
-def load_mtp_drafter(path: str | Path, model: Any, target_config: dict) -> Drafter:
+def load_drafter_for(path: str | Path, model: Any, target_config: dict) -> Drafter:
+    """Loads either kind; mlx-vlm tells them apart by the drafter's model_type."""
     problem = drafter_problem(path, target_config)
     if problem:
         raise ValueError(f"draft model at {path} is not compatible: {problem}")
     draft_model, kind = load_drafter(str(path))
     validate_drafter_compatibility(model, draft_model, kind)
+    if kind == "dflash":
+        config = draft_model.config
+        return Drafter(model=draft_model, kind=kind, block_size=_dflash_block_total(draft_model, None),
+                       target_layer_ids=tuple(int(i) for i in config.target_layer_ids),
+                       window=int(getattr(config, "sliding_window", 0) or 0))
     block_size = int(getattr(draft_model.config, "block_size", 3))
     return Drafter(model=draft_model, kind=kind, block_size=block_size)
+
+
+load_mtp_drafter = load_drafter_for  # the name model_kit used before there were two kinds
 
 
 def _language_model(model: Any) -> Any:
@@ -104,13 +143,14 @@ def _cache_positions(prompt_cache: list[Any], rows: int) -> list[int]:
 
 @dataclass
 class _Verify:
-    hidden: mx.array
+    hidden: mx.array                    # what the drafter drafts from next: last layer (mtp) or captured layers (dflash)
     gdn_states: Any
-    target_tokens: Optional[mx.array]
+    target_tokens: Optional[mx.array]   # greedy rows: the target's own choice at every block position
+    logits: Optional[mx.array] = None   # sampling rows (dflash): the block's logits
 
 
 def _verify_block(lm: Any, verify_input: mx.array, prompt_cache: list[Any], rope_deltas: Any,
-                  greedy: bool) -> _Verify:
+                  greedy: bool, drafter: Optional[Drafter] = None) -> _Verify:
     """The target's forward over [bonus, drafts...] as ONE plain batched pass, the way the plain
     decode step calls it (same RoPE deltas), returning the last-layer hidden and the
     linear-attention inputs the rollback needs. Not mlx-vlm 0.6.16's exact verifier: that one
@@ -120,11 +160,20 @@ def _verify_block(lm: Any, verify_input: mx.array, prompt_cache: list[Any], rope
     if not getattr(lm, "_lmk_gdn_convs_marked", False):
         mark_gdn_convs_for_verify_recording(lm)
         lm._lmk_gdn_convs_marked = True
-    kwargs = dict(cache=prompt_cache, capture_layer_ids=[], return_hidden=True, skip_logits=True)
+    dflash = drafter is not None and drafter.is_dflash
+    if dflash:
+        # the drafter wants a few layers' states for every block position, and the walk needs logits
+        kwargs = dict(cache=prompt_cache, capture_layer_ids=list(drafter.target_layer_ids))
+    else:
+        kwargs = dict(cache=prompt_cache, capture_layer_ids=[], return_hidden=True, skip_logits=True)
     if rope_deltas is not None:
         kwargs["rope_deltas"] = rope_deltas
     with GdnVerifyRecorder() as recorder:
         out = lm(verify_input, **kwargs)
+    if dflash:
+        hidden = drafter.hidden_from(out)
+        target = mx.argmax(out.logits, axis=-1).astype(TOKEN_DTYPE) if greedy else None
+        return _Verify(hidden=hidden, gdn_states=recorder.states(), target_tokens=target, logits=out.logits)
     hidden = out.hidden_states[-1]
     target = lm.speculative_argmax_from_hidden(hidden) if greedy else None
     return _Verify(hidden=hidden, gdn_states=recorder.states(), target_tokens=target)
@@ -231,6 +280,45 @@ def speculative_round(
     return RoundResult(new_tokens=new_tokens, finish=finish, hidden=next_hidden, accepted=accepted)
 
 
+def dflash_round(
+    model: Any,
+    drafter: Drafter,
+    prompt_cache: list[Any],
+    bonus: int,
+    context: mx.array,
+    draft_cache: list[Any],
+    sampler: Callable[[mx.array], mx.array],
+    budget: int,
+    block_size: int,
+    truncate: Callable[[int, list[int]], tuple[list[int], Optional[str]]],
+    emitted: int,
+    rope_deltas: Any = None,
+) -> RoundResult:
+    """One draft/verify round for a single row with a DFlash drafter: draft a block from the
+    bonus and the context states, verify it in one plain forward (recording for rollback), walk
+    the acceptance, roll the target back. `context` is the target states the drafter has not
+    seen yet ([1, n, dim]); the result's `hidden` is the next one (the block's accepted part)."""
+    lm = _language_model(model)
+    greedy = bool(getattr(sampler, "greedy", False))
+    draft_sampler = (lambda logits: mx.argmax(logits, axis=-1).astype(TOKEN_DTYPE)) if greedy else sampler
+    draft_tokens = drafter.model.draft_block(bonus, context, draft_cache, block_size, draft_sampler, TOKEN_DTYPE)
+    verify_input = mx.concatenate([mx.array([[bonus]], dtype=TOKEN_DTYPE), draft_tokens.astype(TOKEN_DTYPE)], axis=1)
+    with mx.stream(generation_stream):
+        verify = _verify_block(lm, verify_input, prompt_cache, rope_deltas, greedy, drafter=drafter)
+    if greedy:
+        accepted, new_tokens = _speculative_walk(draft_tokens, verify.target_tokens, budget)
+    else:
+        accepted_list, new_tokens_list = _sample_dflash_target_walk(
+            verify.logits, draft_tokens, sampler, [budget], row_ids=[0], base_positions=[emitted])
+        accepted, new_tokens = accepted_list[0], list(new_tokens_list[0])
+    _record_speculative_round(drafter.model, accepted, block_size - 1)
+    if accepted < block_size - 1:
+        with mx.stream(generation_stream):
+            lm.rollback_speculative_cache(prompt_cache, verify.gdn_states, accepted, block_size)
+    cut, reason = truncate(0, [int(t) for t in new_tokens])
+    return RoundResult(new_tokens=[cut], finish=[reason], hidden=verify.hidden[:, : accepted + 1, :], accepted=[accepted])
+
+
 class SpeculativeGenerationBatch(GenerationBatch):
     """GenerationBatch whose step is a speculative round whenever the batch allows it.
 
@@ -247,10 +335,14 @@ class SpeculativeGenerationBatch(GenerationBatch):
     def __init__(self, *args, drafter: Drafter, **kwargs):
         super().__init__(*args, **kwargs)
         self.drafter = drafter
+        # mtp: [rows, 1, H], the state that predicted each row's bonus. dflash (one row): the
+        # target states the drafter has not seen yet, [1, n, dim] — the prompt tail after prefill,
+        # the accepted block after a round, the fed token after a plain tick.
         self._hidden: Optional[mx.array] = None
         self._pending: list[bool] = [True] * len(self._rows)
         self._bonus: list[int] = []
         self._drafter_rows = 0  # rows the drafter's state currently covers; 0 = reset needed
+        self._draft_cache: Optional[list] = None  # dflash: the drafter's own KV caches for the row
 
     @classmethod
     def empty(cls, model, stop_criteria, top_logprobs_k=0, *, drafter: Drafter):
@@ -273,17 +365,30 @@ class SpeculativeGenerationBatch(GenerationBatch):
 
     def _forward_logits(self, inputs: mx.array, fwd_kwargs: dict) -> mx.array:
         output = self.model(
-            inputs[:, None], cache=self.prompt_cache, return_hidden=True, **fwd_kwargs
+            inputs[:, None], cache=self.prompt_cache, **self.drafter.capture_kwargs(), **fwd_kwargs
         )
-        hidden_states = getattr(output, "hidden_states", None)
-        self._hidden = hidden_states[-1][:, -1:, :] if hidden_states else None
+        hidden = self.drafter.hidden_from(output)
+        fed = hidden[:, -1:, :] if hidden is not None else None
+        if self.drafter.is_dflash:
+            # keep the states of every token fed since the drafter last saw one (one row only)
+            if fed is None or len(self._rows) != 1:
+                self._hidden = None
+            elif self._hidden is None:
+                self._hidden = fed
+            else:
+                self._hidden = mx.concatenate([self._hidden, fed], axis=1)[:, -max(1, self.drafter.window):, :]
+        else:
+            self._hidden = fed
         logits = output.logits if hasattr(output, "logits") else output
         return logits[:, -1, :]
 
     def append_prefilled_sequence(self, prefilled: GenerationBatch):
         super().append_prefilled_sequence(prefilled)
         joined = getattr(prefilled, "_next_hidden", None)
-        if self._hidden is not None and joined is not None and len(self._pending) > 0:
+        if self.drafter.is_dflash:
+            # the newcomer's prompt tail is its whole context; with company, plain ticks rebuild it
+            self._hidden = joined if len(self._pending) == 0 else None
+        elif self._hidden is not None and joined is not None and len(self._pending) > 0:
             self._hidden = mx.concatenate([self._hidden, joined])
         elif len(self._pending) == 0:
             self._hidden = joined
@@ -300,8 +405,11 @@ class SpeculativeGenerationBatch(GenerationBatch):
         if self._hidden is not None:
             self._hidden = self._hidden[mx.array(keep, mx.int32)] if keep else None
         if self._drafter_rows and keep and len(keep) < self._drafter_rows:
-            self.drafter.model.filter_batch(keep)
-            self._drafter_rows = len(keep)
+            if hasattr(self.drafter.model, "filter_batch"):
+                self.drafter.model.filter_batch(keep)
+            else:
+                self._drafter_rows = 0  # dflash keeps one row's cache: rebuilt at the next round
+            self._drafter_rows = len(keep) if self._drafter_rows else 0
         elif not keep:
             self._drafter_rows = 0
 
@@ -309,8 +417,14 @@ class SpeculativeGenerationBatch(GenerationBatch):
 
     def _round_block_size(self) -> int:
         sizes = [row.draft_tokens for row in self._rows if row.draft_tokens]
-        drafts = min(sizes) if sizes else self.drafter.block_size - 1
-        return max(1, drafts) + 1
+        if sizes:
+            return max(1, min(sizes)) + 1
+        if self.drafter.is_dflash:
+            # mlx-vlm's adaptive block: backs off while deep positions are rejected, grows again after
+            remaining = max(1, min(row.max_tokens - row.num_tokens for row in self._rows)) + 1
+            initial = getattr(self.drafter.model, "dflash_initial_block_size", None)
+            return _dflash_next_block_size(self.drafter.model, self.drafter.block_size, remaining, initial)
+        return self.drafter.block_size
 
     def _has_image_rope(self) -> bool:
         """Qwen3.5 carries mRoPE deltas for every prompt; only image prompts have non-zero ones,
@@ -446,8 +560,11 @@ class SpeculativeGenerationBatch(GenerationBatch):
         rows = self._rows
         count = len(rows)
         if self._drafter_rows != count:
-            scalar = count == 1 and _is_scalar_prompt_cache(self.prompt_cache)
-            self.drafter.model.reset(self.model, left_padding=None if scalar else [0] * count)
+            if self.drafter.is_dflash:
+                self._draft_cache = self.drafter.model.reset(self.model)
+            else:
+                scalar = count == 1 and _is_scalar_prompt_cache(self.prompt_cache)
+                self.drafter.model.reset(self.model, left_padding=None if scalar else [0] * count)
             self._drafter_rows = count
         budgets = [max(1, row.max_tokens - row.num_tokens) for row in rows]
         block_size = min(self._round_block_size(), max(budgets) + 1)
@@ -466,18 +583,24 @@ class SpeculativeGenerationBatch(GenerationBatch):
         # Positions continue exactly as in the plain step: same RoPE deltas, same side state.
         if self._rope_deltas is not None:
             _sync_scalar_rope_deltas(self.model, self.prompt_cache, self._rope_deltas)
-        result = speculative_round(
-            self.model,
-            self.drafter,
-            self.prompt_cache,
-            self._bonus,
-            self._hidden,
-            [row.sampler for row in rows],
-            budgets,
-            block_size,
-            truncate,
-            rope_deltas=self._rope_deltas,
-        )
+        if self.drafter.is_dflash:
+            result = dflash_round(
+                self.model, self.drafter, self.prompt_cache, self._bonus[0], self._hidden, self._draft_cache,
+                rows[0].sampler, budgets[0], block_size, truncate, rows[0].num_tokens, rope_deltas=self._rope_deltas,
+            )
+        else:
+            result = speculative_round(
+                self.model,
+                self.drafter,
+                self.prompt_cache,
+                self._bonus,
+                self._hidden,
+                [row.sampler for row in rows],
+                budgets,
+                block_size,
+                truncate,
+                rope_deltas=self._rope_deltas,
+            )
         responses, keep = [], []
         for idx, row in enumerate(rows):
             tokens, reason = result.new_tokens[idx], result.finish[idx]
