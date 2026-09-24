@@ -28,7 +28,8 @@ mdurl==0.1.2
 mlx==0.32.0
 mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@2c008fd0252b2c569227d12568356ab88ab0560a
 mlx-metal==0.32.0
-mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@321514d633342f079f97fc7b80aa787249217116
+mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@2b31570bdee86e2cdeea049761885aeed524a98c
+mlx-audio==0.5.6
 nest-asyncio==1.6.0
 outlines @ git+https://github.com/dottxt-ai/outlines.git@222ca17254ca0a4de1961e16872efe917b8e3498
 outlines-core==0.1.26
