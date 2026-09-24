@@ -12,7 +12,9 @@ class SpeculativeDecodingNotSupportedError(RuntimeError):
 
 
 def is_speculative_decoding_supported(model_kit: object) -> bool:
-    return type(model_kit) is ModelKit
+    # The sequential kit, and the batched vision kit since it grew a native MTP
+    # drafter (batched_vision/speculative.py); the text-only batched kit has none.
+    return type(model_kit) is ModelKit or type(model_kit).__name__ == "BatchedVisionModelKit"
 
 
 def determine_draft_model_for_generation(

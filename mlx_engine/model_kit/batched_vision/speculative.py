@@ -26,6 +26,7 @@ from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatib
 from mlx_engine.model_kit.batched_vision.batch_generator import (
     GenerationBatch,
     _is_scalar_prompt_cache,
+    _sync_scalar_rope_deltas,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,28 @@ def _cache_positions(prompt_cache: list[Any], rows: int) -> list[int]:
 
 
 @dataclass
+class _Verify:
+    hidden: mx.array
+    gdn_states: Any
+    target_tokens: Optional[mx.array]
+
+
+def _verify_block(lm: Any, verify_input: mx.array, prompt_cache: list[Any], rope_deltas: Any,
+                  greedy: bool) -> _Verify:
+    """The target's forward over [bonus, drafts...], the way the plain decode step calls it
+    (same RoPE deltas), returning the last-layer hidden and the linear-attention states the
+    rollback needs. Greedy targets come from the fused argmax, like mlx-vlm's own loop."""
+    kwargs = dict(cache=prompt_cache, capture_layer_ids=[], return_hidden=True,
+                  return_shared_kv=True, skip_logits=True)
+    if rope_deltas is not None:
+        kwargs["rope_deltas"] = rope_deltas
+    out = lm(verify_input, **kwargs)
+    hidden = out.hidden_states[-1]
+    target = lm.speculative_argmax_from_hidden(hidden) if greedy else None
+    return _Verify(hidden=hidden, gdn_states=getattr(out, "gdn_states", None), target_tokens=target)
+
+
+@dataclass
 class RoundResult:
     new_tokens: list[list[int]]      # per row, already cut at a stop token or the budget
     finish: list[Optional[str]]      # per row: None, "stop" or "length"
@@ -116,6 +139,7 @@ def speculative_round(
     budgets: list[int],
     block_size: int,
     truncate: Callable[[int, list[int]], tuple[list[int], Optional[str]]],
+    rope_deltas: Any = None,
 ) -> RoundResult:
     """One draft/verify round for every row of the batch.
 
@@ -148,23 +172,33 @@ def speculative_round(
         [mx.array(bonus, dtype=TOKEN_DTYPE)[:, None], draft_tokens.astype(TOKEN_DTYPE)],
         axis=1,
     )
+    # Greedy rows are verified the way mlx-vlm verifies them (the fused argmax over
+    # the block): the same kernels as its own loop, so the output matches plain
+    # decoding token for token. Sampling rows draw the target token with their own
+    # sampler from logits projected per position.
+    all_greedy = all(getattr(sampler, "greedy", False) for sampler in samplers)
     with mx.stream(generation_stream):
-        verify = _mtp._mtp_verify_target(
-            lm, verify_input, prompt_cache, samplers[0], sample_target_tokens=False
-        )
+        verify = _verify_block(lm, verify_input, prompt_cache, rope_deltas, all_greedy)
     hidden_full = verify.hidden  # [rows, block_size, H]
+
+    if verify.target_tokens is not None:
+        _, walked_rows = _mtp._speculative_walk_batch(draft_tokens, verify.target_tokens, budgets)
+    else:
+        walked_rows = []
+        for i in range(rows):
+            _, walked = _mtp._speculative_walk_batch_deferred_greedy(
+                lm,
+                hidden_full[i : i + 1],
+                draft_tokens[i : i + 1],
+                samplers[i],
+                [budgets[i]],
+            )
+            walked_rows.append(walked[0])
 
     new_tokens: list[list[int]] = []
     finish: list[Optional[str]] = []
     for i in range(rows):
-        _, walked = _mtp._speculative_walk_batch_deferred_greedy(
-            lm,
-            hidden_full[i : i + 1],
-            draft_tokens[i : i + 1],
-            samplers[i],
-            [budgets[i]],
-        )
-        tokens, reason = truncate(i, walked[0])
+        tokens, reason = truncate(i, walked_rows[i])
         if not tokens:
             raise RuntimeError("a speculative round produced no token for a row")
         new_tokens.append(tokens)
@@ -269,8 +303,15 @@ class SpeculativeGenerationBatch(GenerationBatch):
         drafts = min(sizes) if sizes else self.drafter.block_size - 1
         return max(1, drafts) + 1
 
+    def _has_image_rope(self) -> bool:
+        """Qwen3.5 carries mRoPE deltas for every prompt; only image prompts have non-zero ones,
+        and the verify pass has no way to hand them to the model."""
+        if self._rope_deltas is None:
+            return False
+        return bool(mx.any(self._rope_deltas != 0).item())
+
     def _can_round(self) -> bool:
-        if self._hidden is None or self._rope_deltas is not None:
+        if self._hidden is None or self._has_image_rope():
             return False
         if any(not row.speculative or row.top_logprobs > 0 or row.logits_processors for row in self._rows):
             return False
@@ -359,6 +400,9 @@ class SpeculativeGenerationBatch(GenerationBatch):
                     return out, "length"
             return out, None
 
+        # Positions continue exactly as in the plain step: same RoPE deltas, same side state.
+        if self._rope_deltas is not None:
+            _sync_scalar_rope_deltas(self.model, self.prompt_cache, self._rope_deltas)
         result = speculative_round(
             self.model,
             self.drafter,
@@ -369,6 +413,7 @@ class SpeculativeGenerationBatch(GenerationBatch):
             budgets,
             block_size,
             truncate,
+            rope_deltas=self._rope_deltas,
         )
         responses, keep = [], []
         for idx, row in enumerate(rows):

@@ -97,7 +97,12 @@ def create_sampler(
     top_k = 0 if top_k is None else top_k
 
     if temp == 0:
-        return lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+        def greedy(logprobs):
+            return mx.argmax(logprobs, axis=-1)
+
+        greedy.greedy = True  # speculative decoding verifies greedy rows with the fused argmax
+        return greedy
 
     # Avoid mlx_lm.make_sampler's module-global compiled random helpers: they
     # capture thread-local PRNG state before batched worker threads call them.
