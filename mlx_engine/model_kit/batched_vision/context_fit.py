@@ -29,6 +29,11 @@ from typing import Any
 
 import mlx.core as mx
 from mlx_vlm.models.cache import make_prompt_cache
+from mlx_engine.model_kit.batched_vision.kv_quant import (
+    KVQuantParams,
+    kv_token_capacity,
+    make_prompt_cache_for,
+)
 
 from mlx_engine.model_kit.batched_vision.prefill_plan import (
     PrefillPlan,
@@ -48,7 +53,12 @@ PREFILL_STEP_CANDIDATES = (2_048, 1_024, 512)
 _FAMILY_GEMMA4 = "gemma4"
 _FAMILY_GPT_OSS = "gpt_oss"
 _FAMILY_QWEN3_5 = "qwen3_5"
-_SUPPORTED_CACHE_TYPES = {"KVCache", "RotatingKVCache", "ArraysCache"}
+_SUPPORTED_CACHE_TYPES = {
+    "KVCache",
+    "QuantizedKVCache",
+    "RotatingKVCache",
+    "ArraysCache",
+}
 
 
 def _config_value(config: Any, key: str) -> Any:
@@ -186,12 +196,14 @@ def fit_batched_vlm_context_result(
     *,
     model: Any,
     prefill_step_size: int,
+    kv_quant: KVQuantParams | None = None,
 ) -> ContextFitResult | None:
     """Probe a model and return its context plus request-planning coefficients."""
     return _fit_batched_vlm_context(
         model=model,
         prefill_step_size=prefill_step_size,
         dynamic_prefill=True,
+        kv_quant=kv_quant,
     )
 
 
@@ -200,6 +212,7 @@ def _fit_batched_vlm_context(
     model: Any,
     prefill_step_size: int,
     dynamic_prefill: bool,
+    kv_quant: KVQuantParams | None = None,
 ) -> ContextFitResult | None:
     max_context_length = None
     validated_family = False
@@ -290,6 +303,7 @@ def _fit_batched_vlm_context(
                 query_attention_heads=query_attention_heads,
                 prefill_step_size=prefill_step_size,
                 materializes_attention_scores=materializes_attention_scores,
+                kv_quant=kv_quant,
             )
         finally:
             mx.synchronize()
@@ -510,8 +524,11 @@ def _probe_cache_fit_profile(
     query_attention_heads: int,
     prefill_step_size: int,
     materializes_attention_scores: bool = True,
+    kv_quant: KVQuantParams | None = None,
 ) -> CacheFitProfile | None:
-    prompt_cache = make_prompt_cache(language_model)
+    prompt_cache = make_prompt_cache_for(
+        language_model, kv_quant, make_prompt_cache=make_prompt_cache
+    )
     input_ids = mx.zeros((1, 1), dtype=mx.int32)
     embedding_kwargs = {
         key: value
@@ -550,8 +567,8 @@ def _probe_cache_fit_profile(
             )
             return None
 
-        if cache_type == "KVCache":
-            full_kv_bytes_per_token += cache.nbytes // cache.keys.shape[2]
+        if cache_type in ("KVCache", "QuantizedKVCache"):
+            full_kv_bytes_per_token += cache.nbytes // kv_token_capacity(cache)
             cache_allocation_steps.add(cache.step)
         elif cache_type == "RotatingKVCache":
             if cache.keep != 0:

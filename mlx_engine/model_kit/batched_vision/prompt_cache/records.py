@@ -21,7 +21,9 @@ from mlx_engine.model_kit.batched_vision.prompt_cache.types import (
     RECORD_KIND_STATE_CHECKPOINT,
     RecordKind,
 )
-from mlx_vlm.models.cache import KVCache, RotatingKVCache
+from mlx_vlm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
+
+from mlx_engine.model_kit.batched_vision.kv_quant import is_quantized_kv_cache
 
 
 class PromptCacheRecordCoverageError(ValueError):
@@ -75,9 +77,11 @@ def make_prompt_cache_layout(
 def record_kind_for_prompt_cache(cache: Any) -> RecordKind:
     """Classify one live cache layer into its disk record kind."""
     cache_type = type(cache).__name__
-    if cache_type == "KVCache":
+    if cache_type in ("KVCache", "QuantizedKVCache"):
         # The record format stores canonical cache class names, so classify
-        # with the same module-independent identifier.
+        # with the same module-independent identifier. A quantized full-attention
+        # layer is still a per-token delta: the quantization groups run along
+        # head_dim, so slicing the token axis never splits a group.
         return RECORD_KIND_KV_DELTA
     if cache_type == "RotatingKVCache" and getattr(cache, "keep", 0) == 0:
         return RECORD_KIND_ROTATING_DELTA
@@ -85,6 +89,8 @@ def record_kind_for_prompt_cache(cache: Any) -> RecordKind:
 
 
 def _slice_kv_cache(cache: Any, chunk_start: int, chunk_end: int) -> KVCache:
+    if is_quantized_kv_cache(cache):
+        return _slice_quantized_kv_cache(cache, chunk_start, chunk_end)
     keys, values = cache.state
     if keys.shape[2] != values.shape[2] or chunk_end > keys.shape[2]:
         raise PromptCacheRecordCoverageError(
@@ -97,6 +103,26 @@ def _slice_kv_cache(cache: Any, chunk_start: int, chunk_end: int) -> KVCache:
         mx.contiguous(keys[..., chunk_start:chunk_end, :]),
         mx.contiguous(values[..., chunk_start:chunk_end, :]),
     )
+    return chunk_cache
+
+
+def _slice_quantized_kv_cache(
+    cache: Any, chunk_start: int, chunk_end: int
+) -> QuantizedKVCache:
+    # state = ((packed, scales, biases), (packed, scales, biases)); token axis 2 in each
+    keys, values = cache.state
+    length = keys[0].shape[2]
+    if values[0].shape[2] != length or chunk_end > length:
+        raise PromptCacheRecordCoverageError(
+            "quantized kv cache snapshot covers "
+            f"[0, {length}), not [{chunk_start}, {chunk_end})"
+        )
+    chunk_cache = QuantizedKVCache(group_size=cache.group_size, bits=cache.bits)
+    chunk_cache.keys = tuple(mx.contiguous(k[..., chunk_start:chunk_end, :]) for k in keys)
+    chunk_cache.values = tuple(
+        mx.contiguous(v[..., chunk_start:chunk_end, :]) for v in values
+    )
+    chunk_cache.offset = chunk_end - chunk_start
     return chunk_cache
 
 
@@ -130,10 +156,35 @@ def _slice_rotating_kv_cache(
 
 
 def _concat_kv_delta_caches(caches: list[Any]) -> KVCache:
+    quantized = [is_quantized_kv_cache(cache) for cache in caches]
+    if any(quantized):
+        if not all(quantized):
+            raise ValueError(
+                "prompt cache chunks mix quantized and full-precision KV records; "
+                "they were written with different KV cache settings"
+            )
+        return _concat_quantized_kv_delta_caches(caches)
     keys = mx.concatenate([cache.state[0] for cache in caches], axis=2)
     values = mx.concatenate([cache.state[1] for cache in caches], axis=2)
     cache = KVCache()
     cache.state = (mx.contiguous(keys), mx.contiguous(values))
+    return cache
+
+
+def _concat_quantized_kv_delta_caches(caches: list[Any]) -> QuantizedKVCache:
+    first = caches[0]
+    keys = tuple(
+        mx.contiguous(mx.concatenate([cache.state[0][i] for cache in caches], axis=2))
+        for i in range(3)
+    )
+    values = tuple(
+        mx.contiguous(mx.concatenate([cache.state[1][i] for cache in caches], axis=2))
+        for i in range(3)
+    )
+    cache = QuantizedKVCache(group_size=first.group_size, bits=first.bits)
+    cache.keys = keys
+    cache.values = values
+    cache.offset = keys[0].shape[2]
     return cache
 
 

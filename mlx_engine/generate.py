@@ -262,10 +262,16 @@ def load_model(
             seed=seed,
         )
     elif "vision_config" in config_json:
-        if any([kv_bits, kv_group_size, quantized_kv_start]):
+        if quantized_kv_start:
             raise ValueError(
-                "The mlx-vlm batched vision path does not support KV cache quantization yet"
+                "quantized_kv_start is not supported on the batched vision path: "
+                "the whole KV cache is quantized from the first token"
             )
+        kv_bits, kv_group_size, _ = get_kv_cache_quantization_params(
+            kv_bits,
+            kv_group_size,
+            None,
+        )
         model_kit = BatchedVisionModelKit(
             model_path,
             prefill_step_size=prefill_step_size,
@@ -275,6 +281,8 @@ def load_model(
             seed=seed,
             auto_fit_context=auto_fit_context,
             enable_disk_cache=enable_disk_cache,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
         )
     else:
         kv_bits, kv_group_size, quantized_kv_start = get_kv_cache_quantization_params(

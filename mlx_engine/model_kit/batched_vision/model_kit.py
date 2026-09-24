@@ -33,6 +33,7 @@ from mlx_engine.model_kit.batched_vision.prompt_cache.chunks import (
     build_prefix_cache_chunks,
     first_unsaved_prefix_cache_chunk_index,
 )
+from mlx_engine.model_kit.batched_vision.kv_quant import KVQuantParams
 from mlx_engine.model_kit.batched_vision.prompt_cache.cache_store import (
     VlmPromptCacheStore,
 )
@@ -116,6 +117,9 @@ class BatchedVisionModelKit:
     both text-only and basic image requests.
     """
 
+    # A class attribute: tests build instances without __init__.
+    _kv_quant: KVQuantParams | None = None
+
     model = None
     processor = None
     tokenizer = None
@@ -132,7 +136,14 @@ class BatchedVisionModelKit:
         seed: int | None = None,
         auto_fit_context: bool = True,
         enable_disk_cache: bool = True,
+        kv_bits: int | None = None,
+        kv_group_size: int | None = None,
     ):
+        self._kv_quant = (
+            KVQuantParams(bits=kv_bits, group_size=kv_group_size or 64)
+            if kv_bits
+            else None
+        )
         # External requests and internal generation events share one queue so
         # restore completions wake the generation thread without polling.
         self._requests = Queue()
@@ -255,9 +266,12 @@ class BatchedVisionModelKit:
             self._context_fit_result = None
             self._effective_context_length = None
         else:
+            # The probe measures the quantized caches when they are in use.
+            fit_kwargs = {"kv_quant": self._kv_quant} if self._kv_quant else {}
             self._context_fit_result = fit_batched_vlm_context_result(
                 model=self.model,
                 prefill_step_size=self.prefill_step_size,
+                **fit_kwargs,
             )
             self._effective_context_length = (
                 None
@@ -429,6 +443,7 @@ class BatchedVisionModelKit:
             # LM Studio owns the concurrency limit; do not use mlx-vlm's
             # internal batcher default here.
             completion_batch_size=self._max_seq_nums,
+            kv_quant=self._kv_quant,
             prefill_step_size=(
                 None
                 if _requires_global_no_chunked_prefill(

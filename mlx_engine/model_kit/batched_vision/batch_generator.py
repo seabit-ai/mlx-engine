@@ -36,6 +36,12 @@ from mlx_vlm.generate import (
     wired_limit,
 )
 from mlx_vlm.models.cache import make_prompt_cache
+from mlx_engine.model_kit.batched_vision.kv_quant import (
+    KVQuantParams,
+    batch_from_scalar_quantized,
+    is_quantized_kv_cache,
+    make_prompt_cache_for,
+)
 from mlx_engine.processors.repetition_penalty_processor import (
     RepetitionPenaltyProcessor,
 )
@@ -92,6 +98,9 @@ def _batch_single_cache(cache: list[Any]) -> list[Any]:
     """Convert one scalar restored cache into a batch-size-one cache."""
     batch_cache = []
     for layer_cache in cache:
+        if is_quantized_kv_cache(layer_cache):
+            batch_cache.append(batch_from_scalar_quantized(layer_cache))
+            continue
         if not hasattr(layer_cache, "merge"):
             raise ValueError(
                 f"{type(layer_cache)} does not yet support batching with history"
@@ -773,6 +782,7 @@ class _PromptPrefill:
         cache: Optional[list[Any]] = None,
         all_tokens: Optional[list[int]] = None,
         rope_deltas: Any | None = None,
+        kv_quant: Optional[KVQuantParams] = None,
     ):
         self.model = model
         self.uid = uid
@@ -800,7 +810,9 @@ class _PromptPrefill:
 
         if cache is None:
             # Prompt prefill handles one request, so scalar caches avoid batch overhead.
-            self.prompt_cache = make_prompt_cache(model)
+            self.prompt_cache = make_prompt_cache_for(
+                model, kv_quant, make_prompt_cache=make_prompt_cache
+            )
         else:
             self.prompt_cache = cache
 
@@ -1126,8 +1138,10 @@ class BatchGenerator:
         completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         top_logprobs_k: int = 0,
+        kv_quant: Optional[KVQuantParams] = None,
     ):
         self.model = model
+        self.kv_quant = kv_quant
         self.max_tokens = max_tokens
         self._default_top_logprobs = top_logprobs_k
         self.stop_criteria = stop_criteria
@@ -1274,6 +1288,7 @@ class BatchGenerator:
                 cache=sequence.cache,
                 all_tokens=sequence.all_tokens,
                 rope_deltas=sequence.rope_deltas,
+                kv_quant=self.kv_quant,
             )
 
             if self._prompt_batch.needs_processing():

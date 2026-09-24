@@ -120,11 +120,13 @@ def _estimate_layer_cache_bytes(cache: Any, max_kv_size: int) -> int:
 
 def _scaled_kv_bytes(cache: Any, target_token_count: int) -> int:
     keys, values = cache.state
-    observed_token_count = int(keys.shape[2])
+    key_arrays = tuple(keys) if isinstance(keys, (tuple, list)) else (keys,)
+    value_arrays = tuple(values) if isinstance(values, (tuple, list)) else (values,)
+    observed_token_count = int(key_arrays[0].shape[2])
     if observed_token_count <= 0:
         return 0
 
-    observed_bytes = _array_nbytes(keys) + _array_nbytes(values)
+    observed_bytes = sum(_array_nbytes(array) for array in key_arrays + value_arrays)
     # The final budget should never be smaller than the cache shape we observed.
     target_token_count = max(target_token_count, observed_token_count)
     return (
