@@ -90,17 +90,29 @@ def drafter_config(path: str | Path) -> dict:
     return json.loads((Path(path) / "config.json").read_text())
 
 
+def drafter_kind_from_config(config: dict) -> Optional[str]:
+    """mtp / dflash / None. An MTP head says so in model_type; a DFlash drafter's model_type is
+    the family it was trained on (DFlash 2 for Qwen3.8 says "qwen3") and its architectures /
+    dflash_config say what it is."""
+    if config.get("model_type") in MTP_MODEL_TYPES:
+        return "mtp"
+    if config.get("model_type") in DFLASH_MODEL_TYPES or "dflash_config" in config \
+            or any("DFlash" in str(a) for a in config.get("architectures") or []):
+        return "dflash"
+    return None
+
+
 def drafter_problem(path: str | Path, target_config: dict) -> Optional[str]:
     """Why this drafter cannot serve this model, or None. Cheap: reads two configs."""
     try:
         config = drafter_config(path)
     except (OSError, ValueError) as e:
         return f"cannot read the drafter's config.json: {e}"
-    model_type = config.get("model_type")
-    if model_type not in SUPPORTED_DRAFTER_MODEL_TYPES:
+    if drafter_kind_from_config(config) is None:
         return (
-            f"drafter model_type {model_type!r} is not supported "
-            f"(supported: {', '.join(SUPPORTED_DRAFTER_MODEL_TYPES)})"
+            f"drafter model_type {config.get('model_type')!r} / architectures {config.get('architectures')!r} "
+            f"is not supported (supported: MTP heads {', '.join(MTP_MODEL_TYPES)}; DFlash drafters, whose config "
+            "carries dflash_config)"
         )
     # an MTP head carries the target's text_config; a DFlash drafter's own config has hidden_size
     draft_text = config.get("text_config") or config

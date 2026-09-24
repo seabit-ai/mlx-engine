@@ -334,3 +334,11 @@ def test_a_plain_tick_appends_the_fed_token_to_a_dflash_context():
     batch._rows[0].top_logprobs = 1            # anything that forces a plain step
     batch.next()
     assert batch._hidden.shape == (1, 3, H)    # 2 prompt-tail states + the token the plain step fed
+
+
+def test_the_drafter_kind_is_read_from_the_config_the_way_the_checkpoints_write_it():
+    from mlx_engine.model_kit.batched_vision.speculative import drafter_kind_from_config
+    assert drafter_kind_from_config({"model_type": "qwen3_5_mtp"}) == "mtp"
+    assert drafter_kind_from_config({"model_type": "qwen3", "architectures": ["DFlash2DraftModel"], "dflash_config": {"block_size": 8}}) == "dflash"
+    assert drafter_kind_from_config({"model_type": "dflash2"}) == "dflash"
+    assert drafter_kind_from_config({"model_type": "llama"}) is None
