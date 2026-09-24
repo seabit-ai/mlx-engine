@@ -139,3 +139,83 @@ def test_token_capacity_reads_the_allocated_slots():
     full = KVCache()
     full.state = (keys, keys)
     assert kv_token_capacity(full) == 300
+
+
+# --- speculative verify on a quantized cache -------------------------------------------------
+# mlx-vlm verifies a drafted block position by position over dense keys; on a quantized cache the
+# engine attends the whole block once with a causal mask. The two must agree.
+
+from mlx_engine.model_kit.batched_vision.kv_quant import verify_block_attention
+
+
+def _per_position_reference(queries, dense_keys, dense_values, scale, start=0):
+    """mlx-vlm's loop (language.py, the `target_verify and L > 1` branch) on dequantized keys."""
+    block = queries.shape[2]
+    prefix = dense_keys.shape[-2] - block
+    return mx.concatenate(
+        [
+            mx.fast.scaled_dot_product_attention(
+                queries[:, :, i : i + 1, :],
+                dense_keys[:, :, start : prefix + i + 1, :],
+                dense_values[:, :, start : prefix + i + 1, :],
+                scale=scale,
+            )
+            for i in range(block)
+        ],
+        axis=2,
+    )
+
+
+def _dequantized(cache, keys, values):
+    dk = mx.dequantize(*keys, group_size=cache.group_size, bits=cache.bits)
+    dv = mx.dequantize(*values, group_size=cache.group_size, bits=cache.bits)
+    return dk, dv
+
+
+def test_verify_block_attention_matches_the_per_position_loop_on_dequantized_keys():
+    mx.random.seed(7)
+    rows, q_heads, kv_heads, dim, prefix, block = 1, 4, 2, 64, 300, 4
+    cache = QuantizedKVCache(group_size=64, bits=8)
+    cache.update_and_fetch(mx.random.normal((rows, kv_heads, prefix, dim)), mx.random.normal((rows, kv_heads, prefix, dim)))
+    keys, values = cache.update_and_fetch(mx.random.normal((rows, kv_heads, block, dim)), mx.random.normal((rows, kv_heads, block, dim)))
+    queries = mx.random.normal((rows, q_heads, block, dim))
+    scale = dim**-0.5
+
+    # the reference first: the quantized attention scales its queries in place
+    ref = _per_position_reference(queries, *_dequantized(cache, keys, values), scale)
+    out = verify_block_attention(queries, keys, values, cache=cache, scale=scale, mask=None)
+    assert out.shape == ref.shape == (rows, q_heads, block, dim)
+    assert mx.allclose(out, ref, atol=1e-3, rtol=1e-3).item()
+
+
+def test_verify_block_attention_hides_each_rows_left_padding_in_a_batch_cache():
+    mx.random.seed(11)
+    rows, q_heads, kv_heads, dim, prefix, block = 2, 4, 2, 64, 40, 3
+    pads = [5, 0]
+    cache = BatchQuantizedKVCache(pads, group_size=64, bits=8)
+    cache.update_and_fetch(mx.random.normal((rows, kv_heads, prefix, dim)), mx.random.normal((rows, kv_heads, prefix, dim)))
+    keys, values = cache.update_and_fetch(mx.random.normal((rows, kv_heads, block, dim)), mx.random.normal((rows, kv_heads, block, dim)))
+    queries = mx.random.normal((rows, q_heads, block, dim))
+    scale = dim**-0.5
+
+    dk, dv = _dequantized(cache, keys, values)
+    refs = [_per_position_reference(queries[row : row + 1], dk[row : row + 1], dv[row : row + 1], scale, start=pad)
+            for row, pad in enumerate(pads)]  # before: the quantized attention scales its queries in place
+    out = verify_block_attention(queries, keys, values, cache=cache, scale=scale, mask=None)
+    for row, (pad, ref) in enumerate(zip(pads, refs)):
+        assert mx.allclose(out[row : row + 1], ref, atol=1e-3, rtol=1e-3).item(), f"row {row} (pad {pad})"
+
+
+def test_the_patched_verify_attention_only_takes_over_quantized_caches():
+    from mlx_engine.model_kit.patches import qwen3_5 as patches
+
+    calls = []
+    original = patches.OriginalVlmQwen3_5TargetVerifyLeftPaddedAttention
+    patches.OriginalVlmQwen3_5TargetVerifyLeftPaddedAttention = lambda *a, **k: calls.append("original") or None
+    try:
+        dense = KVCache()
+        q = mx.zeros((1, 2, 3, 8))
+        assert patches._patched_vlm_qwen3_5_target_verify_left_padded_attention(q, q, q, cache=dense, scale=1.0, mask=None) is None
+        assert calls == ["original"]
+    finally:
+        patches.OriginalVlmQwen3_5TargetVerifyLeftPaddedAttention = original

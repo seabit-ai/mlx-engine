@@ -37,6 +37,7 @@ from mlx_lm.models.gated_delta import gated_delta_update
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.qwen3_next import Qwen3NextAttention
 from mlx_vlm.models.base import LanguageModelOutput
+from mlx_engine.model_kit.batched_vision.kv_quant import verify_block_attention
 from mlx_vlm.models.qwen3_5 import language as vlm_qwen3_5_language
 from mlx_vlm.models.qwen3_5.language import (
     LanguageModel as VlmQwen3_5LanguageModel,
@@ -60,6 +61,25 @@ OriginalVlmQwen3_5IsSingleRowBatchCache = (
 OriginalVlmQwen3_5RaggedDecodeAttention = (
     vlm_qwen3_5_language._qwen3_5_ragged_decode_attention
 )
+OriginalVlmQwen3_5TargetVerifyLeftPaddedAttention = (
+    vlm_qwen3_5_language._target_verify_left_padded_attention
+)
+
+
+def _patched_vlm_qwen3_5_target_verify_left_padded_attention(
+    queries, keys, values, *, cache, scale, mask
+):
+    """Speculative verify on a quantized KV cache (lmk: speculative_decoding with
+    kv_cache_bits 8). mlx-vlm returns None here for quantized caches and then
+    slices dense keys, which a quantized cache does not have; the block is
+    attended in one masked quantized call instead. Dense caches are untouched."""
+    if hasattr(cache, "bits") and queries.ndim == 4 and queries.shape[2] > 1:
+        return verify_block_attention(
+            queries, keys, values, cache=cache, scale=scale, mask=mask
+        )
+    return OriginalVlmQwen3_5TargetVerifyLeftPaddedAttention(
+        queries, keys, values, cache=cache, scale=scale, mask=mask
+    )
 
 
 def _patched_vlm_qwen3_5_ragged_decode_attention(*args, **kwargs):
@@ -724,4 +744,7 @@ def apply_patches():
     )
     vlm_qwen3_5_language._qwen3_5_ragged_decode_attention = (
         _patched_vlm_qwen3_5_ragged_decode_attention
+    )
+    vlm_qwen3_5_language._target_verify_left_padded_attention = (
+        _patched_vlm_qwen3_5_target_verify_left_padded_attention
     )

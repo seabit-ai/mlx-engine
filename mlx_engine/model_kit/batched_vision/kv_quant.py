@@ -89,3 +89,42 @@ def kv_token_capacity(cache: Any) -> int:
     if isinstance(keys, (tuple, list)):
         keys = keys[0]
     return int(keys.shape[2])
+
+
+def verify_block_attention(
+    queries: mx.array,
+    keys: Any,
+    values: Any,
+    *,
+    cache: Any,
+    scale: float,
+    mask: Any,
+) -> mx.array:
+    """Target-verify attention over a block of L > 1 new tokens on a quantized cache.
+
+    mlx-vlm verifies a speculative block position by position, slicing dense keys,
+    which a quantized cache cannot serve: its keys are (packed, scales, biases)
+    tuples. The same result comes from one quantized attention over the whole
+    block with a causal mask — block token i sees the prefix and block tokens
+    0..i — which quantized_scaled_dot_product_attention already supports. Rows
+    of a batch cache that start with left padding do not see the padding.
+    ``keys``/``values`` are what update_and_fetch returned: sliced to the valid
+    length, the block at the end."""
+    from mlx_vlm.models.base import scaled_dot_product_attention
+
+    block = queries.shape[2]
+    total = keys[0].shape[-2]
+    q_idx = mx.arange(total - block, total)[:, None]
+    k_idx = mx.arange(total)[None, :]
+    allowed = q_idx >= k_idx  # [block, total]
+    left_padding = getattr(cache, "left_padding", None)
+    if isinstance(left_padding, mx.array) and left_padding.ndim > 0 and left_padding.size > 0:
+        pads = mx.maximum(left_padding, 0).astype(mx.int32)  # [rows]
+        allowed = allowed[None, None] & (k_idx[None, None] >= pads[:, None, None, None])  # [rows, 1, block, total]
+    if isinstance(mask, mx.array) and mask.ndim >= 2:
+        given = mask[..., -block:, :total]
+        if given.dtype == mx.bool_:
+            allowed = allowed & given
+        else:  # additive
+            allowed = mx.where(allowed, given, mx.finfo(given.dtype).min)
+    return scaled_dot_product_attention(queries, keys, values, cache=cache, scale=scale, mask=allowed)
