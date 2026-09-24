@@ -180,46 +180,6 @@ def test_vlm_qwen3_5_attention_text_fast_path_uses_qwen3_next(monkeypatch):
     assert calls == [("qwen3_next", self_obj, "x", "mask", "cache")]
 
 
-def test_vlm_qwen3_5_attention_target_verify_uses_original_vlm(monkeypatch):
-    calls = []
-
-    def fake_qwen3_next_call(*args, **kwargs):
-        raise AssertionError("Qwen3Next fast path should not be used")
-
-    def fake_original_call(
-        self,
-        x,
-        mask=None,
-        cache=None,
-        position_ids=None,
-        position_embeddings=None,
-        **kwargs,
-    ):
-        calls.append((self, x, mask, cache, position_ids, position_embeddings, kwargs))
-        return "target-verify"
-
-    self_obj = object()
-    monkeypatch.setattr(Qwen3NextAttention, "__call__", fake_qwen3_next_call)
-    monkeypatch.setattr(
-        qwen3_5_patches,
-        "OriginalVlmQwen3_5AttentionCall",
-        fake_original_call,
-    )
-
-    result = qwen3_5_patches._patched_vlm_qwen3_5_attention_call(
-        self_obj,
-        "x",
-        mask="mask",
-        cache="cache",
-        target_verify=True,
-    )
-
-    assert result == "target-verify"
-    assert calls == [
-        (self_obj, "x", "mask", "cache", None, None, {"target_verify": True})
-    ]
-
-
 def test_vlm_qwen3_5_attention_left_padded_decode_uses_original_vlm(monkeypatch):
     calls = []
 
@@ -262,7 +222,7 @@ def test_vlm_qwen3_5_attention_left_padded_decode_uses_original_vlm(monkeypatch)
             "cache",
             None,
             None,
-            {"target_verify": False},
+            {},
         )
     ]
 
@@ -311,7 +271,7 @@ def test_vlm_qwen3_5_attention_position_embeddings_uses_original_vlm(monkeypatch
             "cache",
             None,
             position_embeddings,
-            {"target_verify": False},
+            {},
         )
     ]
 
@@ -386,14 +346,15 @@ def test_vlm_qwen3_5_gated_delta_fast_path_skips_upstream_decode_conv(monkeypatc
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "seq_len, kwargs",
     [
-        {"target_verify": True},
-        {"gdn_sink": []},
+        (1, {}),                          # no cache: nothing for the fast path to reuse
+        (2, {"cache": [None, None]}),     # more than one token (prefill, a verify block)
     ],
 )
 def test_vlm_qwen3_5_gated_delta_special_cases_use_original_vlm(
     monkeypatch,
+    seq_len,
     kwargs,
 ):
     calls = []
@@ -409,7 +370,7 @@ def test_vlm_qwen3_5_gated_delta_special_cases_use_original_vlm(
     )
 
     layer = _FakeVlmGatedDeltaNet()
-    inputs = mx.ones((1, 1, layer.hidden_size))
+    inputs = mx.ones((1, seq_len, layer.hidden_size))
 
     result = qwen3_5_patches._patched_vlm_qwen3_5_gated_delta_net_call(
         layer,
@@ -424,9 +385,7 @@ def test_vlm_qwen3_5_gated_delta_special_cases_use_original_vlm(
             inputs,
             {
                 "mask": None,
-                "cache": None,
-                "gdn_sink": kwargs.get("gdn_sink"),
-                "target_verify": kwargs.get("target_verify", False),
+                "cache": kwargs.get("cache"),
             },
         )
     ]
@@ -466,8 +425,6 @@ def test_vlm_qwen3_5_gated_delta_ragged_cache_uses_original_vlm(monkeypatch):
             {
                 "mask": None,
                 "cache": cache,
-                "gdn_sink": None,
-                "target_verify": False,
             },
         )
     ]

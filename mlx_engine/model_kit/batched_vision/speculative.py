@@ -112,8 +112,10 @@ def _verify_block(lm: Any, verify_input: mx.array, prompt_cache: list[Any], rope
     """The target's forward over [bonus, drafts...], the way the plain decode step calls it
     (same RoPE deltas), returning the last-layer hidden and the linear-attention states the
     rollback needs. Greedy targets come from the fused argmax, like mlx-vlm's own loop."""
+    # speculative_verify: mlx-vlm 0.6.16 routes the block through its exact verifier (the
+    # same call as its speculative_verify_hidden), instead of a flag on the attention layers.
     kwargs = dict(cache=prompt_cache, capture_layer_ids=[], return_hidden=True,
-                  return_shared_kv=True, skip_logits=True)
+                  return_shared_kv=True, skip_logits=True, speculative_verify=True)
     if rope_deltas is not None:
         kwargs["rope_deltas"] = rope_deltas
     out = lm(verify_input, **kwargs)

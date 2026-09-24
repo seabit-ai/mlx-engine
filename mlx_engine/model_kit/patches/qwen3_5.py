@@ -37,7 +37,6 @@ from mlx_lm.models.gated_delta import gated_delta_update
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.qwen3_next import Qwen3NextAttention
 from mlx_vlm.models.base import LanguageModelOutput
-from mlx_engine.model_kit.batched_vision.kv_quant import verify_block_attention
 from mlx_vlm.models.qwen3_5 import language as vlm_qwen3_5_language
 from mlx_vlm.models.qwen3_5.language import (
     LanguageModel as VlmQwen3_5LanguageModel,
@@ -61,25 +60,6 @@ OriginalVlmQwen3_5IsSingleRowBatchCache = (
 OriginalVlmQwen3_5RaggedDecodeAttention = (
     vlm_qwen3_5_language._qwen3_5_ragged_decode_attention
 )
-OriginalVlmQwen3_5TargetVerifyLeftPaddedAttention = (
-    vlm_qwen3_5_language._target_verify_left_padded_attention
-)
-
-
-def _patched_vlm_qwen3_5_target_verify_left_padded_attention(
-    queries, keys, values, *, cache, scale, mask
-):
-    """Speculative verify on a quantized KV cache (lmk: speculative_decoding with
-    kv_cache_bits 8). mlx-vlm returns None here for quantized caches and then
-    slices dense keys, which a quantized cache does not have; the block is
-    attended in one masked quantized call instead. Dense caches are untouched."""
-    if hasattr(cache, "bits") and queries.ndim == 4 and queries.shape[2] > 1:
-        return verify_block_attention(
-            queries, keys, values, cache=cache, scale=scale, mask=mask
-        )
-    return OriginalVlmQwen3_5TargetVerifyLeftPaddedAttention(
-        queries, keys, values, cache=cache, scale=scale, mask=mask
-    )
 
 
 def _patched_vlm_qwen3_5_ragged_decode_attention(*args, **kwargs):
@@ -552,12 +532,12 @@ def _patched_vlm_qwen3_5_attention_call(
     cache: Optional[Any] = None,
     position_ids: Optional[mx.array] = None,
     position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
-    target_verify: bool = False,
 ) -> mx.array:
+    # mlx-vlm 0.6.16: a speculative verify pass no longer reaches attention with a flag; the
+    # language model routes it through its exact verifier. Multi-token inputs take the original.
     if (
         position_ids is not None
         or position_embeddings is not None
-        or target_verify
         or (isinstance(mask, str) and mask == "left_padded_decode")
     ):
         return OriginalVlmQwen3_5AttentionCall(
@@ -567,7 +547,6 @@ def _patched_vlm_qwen3_5_attention_call(
             cache=cache,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
-            target_verify=target_verify,
         )
 
     return Qwen3NextAttention.__call__(self, x, mask, cache)
@@ -578,13 +557,9 @@ def _patched_vlm_qwen3_5_gated_delta_net_call(
     inputs: mx.array,
     mask: Optional[mx.array] = None,
     cache: Optional[Any] = None,
-    gdn_sink: Optional[list] = None,
-    target_verify: bool = False,
 ) -> mx.array:
     if (
-        target_verify
-        or gdn_sink is not None
-        or inputs.shape[1] != 1
+        inputs.shape[1] != 1
         or cache is None
         or _has_vlm_qwen3_5_ragged_cache_state(cache)
     ):
@@ -593,8 +568,6 @@ def _patched_vlm_qwen3_5_gated_delta_net_call(
             inputs,
             mask=mask,
             cache=cache,
-            gdn_sink=gdn_sink,
-            target_verify=target_verify,
         )
 
     return _vlm_qwen3_5_gated_delta_net_fast_path(
@@ -744,7 +717,4 @@ def apply_patches():
     )
     vlm_qwen3_5_language._qwen3_5_ragged_decode_attention = (
         _patched_vlm_qwen3_5_ragged_decode_attention
-    )
-    vlm_qwen3_5_language._target_verify_left_padded_attention = (
-        _patched_vlm_qwen3_5_target_verify_left_padded_attention
     )
