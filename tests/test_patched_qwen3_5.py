@@ -1020,3 +1020,54 @@ def test_vlm_qwen3_5_text_prompt_cache_restore_matches_original_vlm():
         "VLM Qwen3.5 text prompt-cache restore fast path changed logits "
         f"(max diff {diff:.6f})."
     )
+
+
+def test_the_verify_recorder_lays_out_what_the_rollback_reads_and_restores_the_hooks(monkeypatch):
+    """One plain forward of a drafted block records, per gated-delta layer, the recurrence inputs
+    and the conv window input as the 12-tuple rollback_speculative_cache reads; only marked convs
+    are recorded; the module function and nn.Conv1d are restored afterwards."""
+    import mlx.nn as nn
+
+    calls = []
+    monkeypatch.setattr(qwen3_5_patches.vlm_qwen3_5_language, "gated_delta_update",
+                        lambda q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True: calls.append("gdu") or ("out", "state"))
+    original_gdu = qwen3_5_patches.vlm_qwen3_5_language.gated_delta_update
+    original_conv_call = nn.Conv1d.__call__
+    marked = nn.Conv1d(4, 4, 3)
+    marked._lmk_gdn_verify_record = True
+    unmarked = nn.Conv1d(4, 4, 3)
+    with qwen3_5_patches.GdnVerifyRecorder() as rec:
+        unmarked(mx.zeros((1, 5, 4)))                       # some other conv: not recorded
+        marked(mx.zeros((1, 6, 4)))                         # the GDN conv: recorded with its kernel size
+        out = qwen3_5_patches.vlm_qwen3_5_language.gated_delta_update("q", "k", "v", "a", "b", "A", "dt", state="s0", mask="m", use_kernel=False)
+    assert out == ("out", "state") and calls == ["gdu"]
+    states = rec.states()
+    assert len(states) == 1 and len(states[0]) == 12
+    q, k, v, a, b, A_log, dt_bias, state, mask, conv_input, kernel, intermediate = states[0]
+    assert (q, k, v, a, b, A_log, dt_bias, state, mask) == ("q", "k", "v", "a", "b", "A", "dt", "s0", "m")
+    assert conv_input.shape == (1, 6, 4) and kernel == 3 and intermediate is None
+    assert qwen3_5_patches.vlm_qwen3_5_language.gated_delta_update is original_gdu   # hooks are gone
+    assert nn.Conv1d.__call__ is original_conv_call
+
+
+def test_marking_finds_the_gated_delta_convs_by_the_layer_flag():
+    import mlx.nn as nn
+
+    class _Attn:
+        def __init__(self):
+            self.conv1d = nn.Conv1d(2, 2, 2)
+
+    class _Layer:
+        def __init__(self, linear):
+            self.is_linear = linear
+            if linear:
+                self.linear_attn = _Attn()
+
+    class _Inner:
+        layers = [_Layer(True), _Layer(False), _Layer(True)]
+
+    class _LM:
+        model = _Inner()
+
+    assert qwen3_5_patches.mark_gdn_convs_for_verify_recording(_LM()) == 2
+    assert getattr(_LM.model.layers[0].linear_attn.conv1d, "_lmk_gdn_verify_record", False) is True

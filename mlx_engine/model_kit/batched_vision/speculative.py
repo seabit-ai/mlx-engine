@@ -23,6 +23,8 @@ from mlx_vlm.speculative import mtp as _mtp
 from mlx_vlm.speculative.common import _record_speculative_round, generation_stream
 from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
+from mlx_engine.model_kit.patches.qwen3_5 import GdnVerifyRecorder, mark_gdn_convs_for_verify_recording
+
 from mlx_engine.model_kit.batched_vision.batch_generator import (
     GenerationBatch,
     _is_scalar_prompt_cache,
@@ -109,22 +111,23 @@ class _Verify:
 
 def _verify_block(lm: Any, verify_input: mx.array, prompt_cache: list[Any], rope_deltas: Any,
                   greedy: bool) -> _Verify:
-    """The target's forward over [bonus, drafts...], the way the plain decode step calls it
-    (same RoPE deltas), returning the last-layer hidden and the linear-attention states the
-    rollback needs. Greedy targets come from the fused argmax, like mlx-vlm's own loop."""
-    # speculative_verify: mlx-vlm 0.6.16 routes the block through its exact verifier (the
-    # same call as its speculative_verify_hidden), instead of a flag on the attention layers.
-    # speculative_verify: mlx-vlm 0.6.16 routes the block through its exact verifier (the same
-    # call as its speculative_verify_hidden); the plain forward no longer returns the gdn_states
-    # the rollback needs, so this is the only verify path.
-    kwargs = dict(cache=prompt_cache, capture_layer_ids=[], return_hidden=True,
-                  return_shared_kv=True, skip_logits=True, speculative_verify=True)
+    """The target's forward over [bonus, drafts...] as ONE plain batched pass, the way the plain
+    decode step calls it (same RoPE deltas), returning the last-layer hidden and the
+    linear-attention inputs the rollback needs. Not mlx-vlm 0.6.16's exact verifier: that one
+    works token by token (109 ms for 8 tokens against ~47, SPD-012) to be bit-exact; this pass
+    is greedy-correct up to floating-point tie-breaking (owner, 2026-09-24). Greedy targets come
+    from the fused argmax, like mlx-vlm's own loop."""
+    if not getattr(lm, "_lmk_gdn_convs_marked", False):
+        mark_gdn_convs_for_verify_recording(lm)
+        lm._lmk_gdn_convs_marked = True
+    kwargs = dict(cache=prompt_cache, capture_layer_ids=[], return_hidden=True, skip_logits=True)
     if rope_deltas is not None:
         kwargs["rope_deltas"] = rope_deltas
-    out = lm(verify_input, **kwargs)
+    with GdnVerifyRecorder() as recorder:
+        out = lm(verify_input, **kwargs)
     hidden = out.hidden_states[-1]
     target = lm.speculative_argmax_from_hidden(hidden) if greedy else None
-    return _Verify(hidden=hidden, gdn_states=getattr(out, "gdn_states", None), target_tokens=target)
+    return _Verify(hidden=hidden, gdn_states=recorder.states(), target_tokens=target)
 
 
 @dataclass

@@ -744,3 +744,68 @@ def apply_patches():
     vlm_qwen3_5_language._qwen3_5_left_padded_attention = (
         _patched_vlm_qwen3_5_left_padded_attention
     )
+
+
+# ---- the verify pass of speculative decoding: a plain batched forward, with what the
+# rollback needs recorded on the way (lmk, 2026-09-24; docs/design/2026-09-23-own-engine.md 补记三).
+#
+# mlx-vlm 0.6.16 verifies a drafted block through its "exact" verifier, which works token by
+# token so that the logits match plain decoding bit for bit: 109 ms for 8 tokens on an M3 Ultra
+# against ~47 ms for one plain forward of the same 8 tokens (SPD-012). The plain forward does
+# not return the gated-delta layers' inputs, which rollback_speculative_cache needs to rebuild
+# each recurrent state at the accepted position; recording them here is what mlx-dspark does.
+
+
+class GdnVerifyRecorder:
+    """Inside the `with`, every call of the language module's gated_delta_update and of a
+    marked GDN conv records its inputs; states() lays them out as the 12-tuples
+    rollback_speculative_cache reads (intermediate_states None: it re-runs the accepted prefix)."""
+
+    def __init__(self):
+        self.deltas: list = []
+        self.convs: list = []
+
+    def __enter__(self):
+        self._orig_gdu = vlm_qwen3_5_language.gated_delta_update
+        self._orig_conv = nn.Conv1d.__call__
+        deltas, convs, orig_gdu, orig_conv = self.deltas, self.convs, self._orig_gdu, self._orig_conv
+
+        def record_gdu(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True):
+            deltas.append((q, k, v, a, b, A_log, dt_bias, state, mask))
+            return orig_gdu(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=use_kernel)
+
+        def record_conv(conv, x, *args, **kwargs):
+            if getattr(conv, "_lmk_gdn_verify_record", False):
+                convs.append((x, int(conv.weight.shape[1])))  # nn.Conv1d weight: (out, kernel, in)
+            return orig_conv(conv, x, *args, **kwargs)
+
+        vlm_qwen3_5_language.gated_delta_update = record_gdu
+        nn.Conv1d.__call__ = record_conv
+        return self
+
+    def __exit__(self, *exc):
+        vlm_qwen3_5_language.gated_delta_update = self._orig_gdu
+        nn.Conv1d.__call__ = self._orig_conv
+        return False
+
+    def states(self) -> list:
+        if len(self.deltas) != len(self.convs):
+            raise RuntimeError(
+                f"recorded {len(self.deltas)} gated-delta updates but {len(self.convs)} conv inputs: "
+                "the GDN convs are not marked, or the layer changed shape"
+            )
+        return [
+            (q, k, v, a, b, A_log, dt_bias, state, mask, conv_input, kernel, None)
+            for (q, k, v, a, b, A_log, dt_bias, state, mask), (conv_input, kernel) in zip(self.deltas, self.convs)
+        ]
+
+
+def mark_gdn_convs_for_verify_recording(lm) -> int:
+    """Flags the conv of every gated-delta layer so the recorder tells them from other convs."""
+    marked = 0
+    for layer in getattr(getattr(lm, "model", lm), "layers", []):
+        attn = getattr(layer, "linear_attn", None)
+        if getattr(layer, "is_linear", False) and attn is not None and hasattr(attn, "conv1d"):
+            attn.conv1d._lmk_gdn_verify_record = True
+            marked += 1
+    return marked
