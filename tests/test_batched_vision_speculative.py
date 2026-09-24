@@ -177,9 +177,14 @@ def test_a_joining_row_keeps_pending_flags_and_hidden_states_aligned(monkeypatch
     batch.append_prefilled_sequence(newcomer)
 
     assert batch._pending == [False, True] and batch._hidden.shape == (2, 1, H) and batch._drafter_rows == 0
+    # two rows: plain steps until the batch is alone again (MAX_ROUND_ROWS = 1)
+    responses = batch.next()             # the round's bonus is fed, not re-emitted; the newcomer's token goes out
+    assert [(r.uid, r.token) for r in responses] == [(11, 6)]
+    assert batch._pending == [True, True] and len(fake.calls) == 1
+    batch.MAX_ROUND_ROWS = 2             # the batched round path, kept for when it is trusted
     responses = batch.next()
-    assert [(r.uid, r.token) for r in responses] == [(11, 6), (10, 20), (10, 21), (11, 30)]
-    assert fake.calls[1]["bonus"] == [8, 6] and fake.calls[1]["rows"] == 2
+    assert [(r.uid, r.token) for r in responses] == [(10, 0), (11, 0), (10, 20), (10, 21), (11, 30)]
+    assert fake.calls[1]["bonus"] == [0, 0] and fake.calls[1]["rows"] == 2
     assert batch.drafter.model.resets[-1] == [0, 0]
 
 
@@ -187,6 +192,7 @@ def test_a_finished_row_leaves_the_drafter_and_hidden_state_in_step(monkeypatch)
     fake = _Round([[[7, 2], [8, 9]], [[10]]])
     monkeypatch.setattr(speculative, "speculative_round", fake)
     batch = _batch(_Model(), 2, stop={2})
+    batch.MAX_ROUND_ROWS = 2
 
     batch.next()
     assert len(batch) == 1 and batch.uids == [11] and batch._bonus == [9] and batch._hidden.shape == (1, 1, H)

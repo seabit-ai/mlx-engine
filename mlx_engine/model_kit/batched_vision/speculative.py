@@ -26,6 +26,7 @@ from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatib
 from mlx_engine.model_kit.batched_vision.batch_generator import (
     GenerationBatch,
     _is_scalar_prompt_cache,
+    _materialize_step_outputs,
     _sync_scalar_rope_deltas,
 )
 
@@ -310,8 +311,17 @@ class SpeculativeGenerationBatch(GenerationBatch):
             return False
         return bool(mx.any(self._rope_deltas != 0).item())
 
+    # Rounds run while one request is decoding. With two or more rows, mlx-vlm's
+    # batched rollback did not reproduce plain decoding on mixed-length rows (exp03:
+    # identical prompts fine, code + story diverged at token 53), so a batch of
+    # several rows takes plain steps until it is alone again. The batch bookkeeping
+    # below already handles several rows for the day that path is trusted.
+    MAX_ROUND_ROWS = 1
+
     def _can_round(self) -> bool:
         if self._hidden is None or self._has_image_rope():
+            return False
+        if len(self._rows) > self.MAX_ROUND_ROWS:
             return False
         if any(not row.speculative or row.top_logprobs > 0 or row.logits_processors for row in self._rows):
             return False
@@ -325,15 +335,56 @@ class SpeculativeGenerationBatch(GenerationBatch):
             if self._rows:
                 responses.extend(self._round())
             return responses
-        if not any(self._pending):
-            # The bonus tokens went out with a speculative round; feed them
-            # without emitting them again, then continue decode-ahead.
-            self._advance(self._next_tokens)
-            self._pending = [True] * len(self._rows)
-            return []
-        if not all(self._pending):
-            raise RuntimeError("rows of a speculative batch disagree on pending tokens")
-        return super().next()
+        if all(self._pending):
+            return super().next()
+        return self._plain_tick()
+
+    def _plain_tick(self) -> list[GenerationBatch.Response]:
+        """A plain step for a batch where some rows' last token already went out with
+        a round: those rows are fed without emitting again, the others emit as in
+        decode-ahead. Afterwards every row is pending again."""
+        pending = list(self._pending)
+        inputs = self._next_tokens
+        prev_logprobs, prev_top_idx, prev_top = (
+            self._next_token_logprobs, self._next_top_idx, self._next_top_logprobs
+        )
+        old_lens = [len(row.tokens) for row in self._rows]
+        self._advance(inputs)
+        tokens, logprob_list, top_idx_list, top_logprob_list = _materialize_step_outputs(
+            inputs, prev_logprobs, prev_top_idx, prev_top
+        )
+        responses, keep = [], []
+        for idx, row in enumerate(self._rows):
+            if not pending[idx]:
+                keep.append(idx)
+                continue
+            token = tokens[idx]
+            if len(row.tokens) == old_lens[idx]:
+                row.tokens.append(token)
+            row.num_tokens += 1
+            reason = self._finish_reason(row, token)
+            self._emit_cache_save_snapshot(idx)
+            top = None
+            if row.top_logprobs > 0 and top_idx_list is not None:
+                top = list(zip(top_idx_list[idx][: row.top_logprobs], top_logprob_list[idx][: row.top_logprobs]))
+            responses.append(
+                self.Response(
+                    uid=row.uid,
+                    token=token,
+                    token_logprob=logprob_list[idx] if logprob_list is not None else 0.0,
+                    finish_reason=reason,
+                    top_logprobs=top,
+                    prompt_cache=self.extract_cache(idx) if reason else None,
+                    all_tokens=list(row.tokens) if reason else None,
+                    rope_deltas=self.extract_rope_deltas(idx) if reason else None,
+                )
+            )
+            if reason is None:
+                keep.append(idx)
+        self._pending = [True] * len(self._rows)
+        if len(keep) < len(self._rows):
+            self.filter(keep)
+        return responses
 
     def _finish_reason(self, row, token: int) -> Optional[str]:
         if self.stop_criteria(token):
