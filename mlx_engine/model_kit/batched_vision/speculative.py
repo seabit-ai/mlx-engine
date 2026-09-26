@@ -29,6 +29,7 @@ from mlx_engine.model_kit.patches.qwen3_5 import GdnVerifyRecorder, mark_gdn_con
 
 from mlx_engine.model_kit.batched_vision.batch_generator import (
     GenerationBatch,
+    _apply_logits_processors,
     _is_scalar_prompt_cache,
     _materialize_step_outputs,
     _sync_scalar_rope_deltas,
@@ -191,6 +192,47 @@ def _verify_block(lm: Any, verify_input: mx.array, prompt_cache: list[Any], rope
     return _Verify(hidden=hidden, gdn_states=recorder.states(), target_tokens=target)
 
 
+def _processed_walk(
+    logits_at: Callable[[int], mx.array],
+    bonus: int,
+    draft: list[int],
+    history: list[int],
+    processors: list,
+    sampler: Callable[[mx.array], mx.array],
+    budget: int,
+    base_position: int,
+    stop: Callable[[int], bool] = lambda token: False,
+) -> tuple[int, list[int]]:
+    """The acceptance walk for a row with logits processors, llama.cpp style (SPD-027): position
+    by position, the processors see that position's logits exactly as a plain step would (the
+    tokens fed before it, then the token fed at it), the row's sampler draws from the result,
+    and the walk stops at the first draw that differs from the draft. Processors only ever see
+    tokens that are emitted, so there is no processor state to roll back; the stopping draw is
+    the next bonus and reaches them at the next step. `history` is the tokens fed before the
+    bonus; `logits_at(j)` is the target's [1, V] logits after feeding verify position j."""
+    context = list(history)
+    positioned = callable(getattr(sampler, "sample_target", None))
+    last, accepted, new_tokens = bonus, 0, []
+    for j in range(len(draft) + 1):
+        before = len(context)
+        logits = _apply_logits_processors(logits_at(j), [context], [processors],
+                                          last_tokens=mx.array([last], dtype=TOKEN_DTYPE))
+        if len(context) == before:
+            context.append(last)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if positioned:
+            drawn = sampler.sample_target(logprobs, row_ids=[0], positions=[base_position + j])
+        else:
+            drawn = sampler(logprobs)
+        token = int(drawn.reshape(-1)[0].item())
+        new_tokens.append(token)
+        if len(new_tokens) >= budget or j == len(draft) or token != draft[j] or stop(token):
+            break
+        accepted += 1
+        last = token
+    return accepted, new_tokens
+
+
 @dataclass
 class RoundResult:
     new_tokens: list[list[int]]      # per row, already cut at a stop token or the budget
@@ -210,6 +252,10 @@ def speculative_round(
     block_size: int,
     truncate: Callable[[int, list[int]], tuple[list[int], Optional[str]]],
     rope_deltas: Any = None,
+    processors: Optional[list[list]] = None,
+    histories: Optional[list[list[int]]] = None,
+    emitted: Optional[list[int]] = None,
+    stop: Callable[[int], bool] = lambda token: False,
 ) -> RoundResult:
     """One draft/verify round for every row of the batch.
 
@@ -246,7 +292,9 @@ def speculative_round(
     # the block): the same kernels as its own loop, so the output matches plain
     # decoding token for token. Sampling rows draw the target token with their own
     # sampler from logits projected per position.
-    all_greedy = all(getattr(sampler, "greedy", False) for sampler in samplers)
+    processors = processors or [[] for _ in range(rows)]
+    # rows with processors need per-position logits, not the fused argmax
+    all_greedy = all(getattr(sampler, "greedy", False) for sampler in samplers) and not any(processors)
     with mx.stream(generation_stream):
         verify = _verify_block(lm, verify_input, prompt_cache, rope_deltas, all_greedy)
     hidden_full = verify.hidden  # [rows, block_size, H]
@@ -254,8 +302,19 @@ def speculative_round(
     if verify.target_tokens is not None:
         _, walked_rows = _mtp._speculative_walk_batch(draft_tokens, verify.target_tokens, budgets)
     else:
-        walked_rows = []
-        for i in range(rows):
+        walked_rows = [None] * rows
+    draft_lists = draft_tokens.tolist() if any(processors) else None
+    for i in range(rows):
+        if processors[i]:
+            def logits_at(j: int, i: int = i) -> mx.array:
+                with mx.stream(generation_stream):
+                    logits = lm.speculative_logits_from_hidden(hidden_full[i : i + 1, j : j + 1, :])
+                return logits.reshape(1, -1)
+            _, walked_rows[i] = _processed_walk(
+                logits_at, bonus[i], draft_lists[i], histories[i], processors[i], samplers[i], budgets[i],
+                emitted[i] if emitted else 0, stop,
+            )
+        elif walked_rows[i] is None:
             _, walked = _mtp._speculative_walk_batch_deferred_greedy(
                 lm,
                 hidden_full[i : i + 1],
@@ -263,7 +322,7 @@ def speculative_round(
                 samplers[i],
                 [budgets[i]],
             )
-            walked_rows.append(walked[0])
+            walked_rows[i] = walked[0]
 
     new_tokens: list[list[int]] = []
     finish: list[Optional[str]] = []
@@ -305,6 +364,9 @@ def dflash_round(
     truncate: Callable[[int, list[int]], tuple[list[int], Optional[str]]],
     emitted: int,
     rope_deltas: Any = None,
+    processors: Optional[list] = None,
+    history: Optional[list[int]] = None,
+    stop: Callable[[int], bool] = lambda token: False,
 ) -> RoundResult:
     """One draft/verify round for a single row with a DFlash drafter: draft a block from the
     bonus and the context states, verify it in one plain forward (recording for rollback), walk
@@ -317,7 +379,11 @@ def dflash_round(
     verify_input = mx.concatenate([mx.array([[bonus]], dtype=TOKEN_DTYPE), draft_tokens.astype(TOKEN_DTYPE)], axis=1)
     with mx.stream(generation_stream):
         verify = _verify_block(lm, verify_input, prompt_cache, rope_deltas, greedy, drafter=drafter)
-    if greedy:
+    if processors:
+        accepted, new_tokens = _processed_walk(
+            lambda j: verify.logits[:, j, :], bonus, draft_tokens.reshape(-1).tolist(), history, processors,
+            sampler, budget, emitted, stop)
+    elif greedy:
         accepted, new_tokens = _speculative_walk(draft_tokens, verify.target_tokens, budget)
     else:
         accepted_list, new_tokens_list = _sample_dflash_target_walk(
@@ -338,10 +404,9 @@ class SpeculativeGenerationBatch(GenerationBatch):
     token is still *pending* (sampled by a forward but not emitted, the
     decode-ahead convention of the plain batch) and the hidden state that
     predicted it. A speculative step emits pending tokens first, then runs a
-    round. A plain step is used when any row asks for top_logprobs or carries
-    logits processors, when the batch has image RoPE state, or when the hidden
-    state is unknown; plain steps keep the hidden state fresh so speculation
-    can resume.
+    round. A plain step is used when any row asks for top_logprobs, when the
+    batch has image RoPE state, or when the hidden state is unknown; plain
+    steps keep the hidden state fresh so speculation can resume.
     """
 
     def __init__(self, *args, drafter: Drafter, **kwargs):
@@ -457,7 +522,8 @@ class SpeculativeGenerationBatch(GenerationBatch):
             return False
         if len(self._rows) > self.MAX_ROUND_ROWS:
             return False
-        if any(not row.speculative or row.top_logprobs > 0 or row.logits_processors for row in self._rows):
+        # a round reports no logprobs; logits processors are walked position by position (_processed_walk)
+        if any(not row.speculative or row.top_logprobs > 0 for row in self._rows):
             return False
         return self._round_block_size() >= 2
 
@@ -482,6 +548,11 @@ class SpeculativeGenerationBatch(GenerationBatch):
         prev_logprobs, prev_top_idx, prev_top = (
             self._next_token_logprobs, self._next_top_idx, self._next_top_logprobs
         )
+        # A round already put its bonus into row.tokens; logits processors take row.tokens as the
+        # tokens before `inputs` (decode-ahead), so the bonus would reach them twice (SPD-028).
+        for idx, row in enumerate(self._rows):
+            if not pending[idx]:
+                row.tokens.pop()
         old_lens = [len(row.tokens) for row in self._rows]
         self._advance(inputs)
         tokens, logprob_list, top_idx_list, top_logprob_list = _materialize_step_outputs(
@@ -489,12 +560,12 @@ class SpeculativeGenerationBatch(GenerationBatch):
         )
         responses, keep = [], []
         for idx, row in enumerate(self._rows):
-            if not pending[idx]:
-                keep.append(idx)
-                continue
             token = tokens[idx]
             if len(row.tokens) == old_lens[idx]:
                 row.tokens.append(token)
+            if not pending[idx]:
+                keep.append(idx)
+                continue
             row.num_tokens += 1
             reason = self._finish_reason(row, token)
             self._emit_cache_save_snapshot(idx)
@@ -599,6 +670,7 @@ class SpeculativeGenerationBatch(GenerationBatch):
             result = dflash_round(
                 self.model, self.drafter, self.prompt_cache, self._bonus[0], self._hidden, self._draft_cache,
                 rows[0].sampler, budgets[0], block_size, truncate, rows[0].num_tokens, rope_deltas=self._rope_deltas,
+                processors=rows[0].logits_processors, history=rows[0].tokens[:-1], stop=self.stop_criteria,
             )
         else:
             result = speculative_round(
@@ -612,6 +684,10 @@ class SpeculativeGenerationBatch(GenerationBatch):
                 block_size,
                 truncate,
                 rope_deltas=self._rope_deltas,
+                processors=[row.logits_processors for row in rows],
+                histories=[row.tokens[:-1] for row in rows],
+                emitted=[row.num_tokens for row in rows],
+                stop=self.stop_criteria,
             )
         responses, keep = [], []
         for idx, row in enumerate(rows):

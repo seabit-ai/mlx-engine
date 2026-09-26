@@ -68,7 +68,7 @@ class _Round:
         self.script = list(script)
         self.calls = []
 
-    def __call__(self, model, drafter, prompt_cache, bonus, hidden, samplers, budgets, block_size, truncate, rope_deltas=None):
+    def __call__(self, model, drafter, prompt_cache, bonus, hidden, samplers, budgets, block_size, truncate, rope_deltas=None, **kwargs):
         tokens_by_row = self.script.pop(0)
         self.calls.append(dict(bonus=list(bonus), budgets=list(budgets), block_size=block_size, rows=hidden.shape[0]))
         new_tokens, finish = [], []
