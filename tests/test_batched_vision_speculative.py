@@ -127,7 +127,8 @@ def test_a_stop_token_inside_the_round_ends_the_row_with_its_cache(monkeypatch):
     responses = batch.next()
 
     assert [(r.token, r.finish_reason) for r in responses] == [(5, None), (7, None), (2, "stop")]
-    assert responses[-1].prompt_cache == ["extracted:0"] and responses[-1].all_tokens == [1, 5, 7, 2]
+    # the stop token is the round's last token: emitted, never fed, so not among the tokens the cache covers
+    assert responses[-1].prompt_cache == ["extracted:0"] and responses[-1].all_tokens == [1, 5, 7]
     assert len(batch) == 0
 
 

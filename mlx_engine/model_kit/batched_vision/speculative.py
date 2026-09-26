@@ -390,11 +390,14 @@ def dflash_round(
             verify.logits, draft_tokens, sampler, [budget], row_ids=[0], base_positions=[emitted])
         accepted, new_tokens = accepted_list[0], list(new_tokens_list[0])
     _record_speculative_round(drafter.model, accepted, block_size - 1)
-    if accepted < block_size - 1:
-        with mx.stream(generation_stream):
-            lm.rollback_speculative_cache(prompt_cache, verify.gdn_states, accepted, block_size)
     cut, reason = truncate(0, [int(t) for t in new_tokens])
-    return RoundResult(new_tokens=[cut], finish=[reason], hidden=verify.hidden[:, : accepted + 1, :], accepted=[accepted])
+    # the cache keeps the bonus and every emitted token but the last, like speculative_round; drafts the
+    # target accepted past a stop token or the budget were fed but are not emitted
+    kept = len(cut) - 1
+    if kept < block_size - 1:
+        with mx.stream(generation_stream):
+            lm.rollback_speculative_cache(prompt_cache, verify.gdn_states, kept, block_size)
+    return RoundResult(new_tokens=[cut], finish=[reason], hidden=verify.hidden[:, : kept + 1, :], accepted=[kept])
 
 
 class SpeculativeGenerationBatch(GenerationBatch):
@@ -599,6 +602,9 @@ class SpeculativeGenerationBatch(GenerationBatch):
         return None
 
     def _response(self, idx: int, row, token: int, finish_reason: Optional[str]):
+        """For a token emitted without being fed (a pending token, a round's last token): a finished
+        row's cache holds every token but this one, and all_tokens must say so — the next request
+        takes all_tokens as what the cache covers (SPD-032)."""
         return self.Response(
             uid=row.uid,
             token=token,
@@ -606,7 +612,7 @@ class SpeculativeGenerationBatch(GenerationBatch):
             finish_reason=finish_reason,
             top_logprobs=None,
             prompt_cache=self.extract_cache(idx) if finish_reason else None,
-            all_tokens=list(row.tokens) if finish_reason else None,
+            all_tokens=row.tokens[:-1] if finish_reason else None,
             rope_deltas=self.extract_rope_deltas(idx) if finish_reason else None,
         )
 

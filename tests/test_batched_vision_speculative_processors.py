@@ -237,13 +237,17 @@ def _mtp_hooks(monkeypatch, draft_of):
                             [model.propose(int(bonus[0]), block_size - 1)], dtype=mx.int32))
 
 
-def _run(batch) -> list[int]:
+def _run_responses(batch) -> list:
     out = []
     for _ in range(4 * len(SCRIPT)):
         if not len(batch):
             return out
-        out.extend(r.token for r in batch.next())
+        out.extend(batch.next())
     raise AssertionError("the row never finished")
+
+
+def _run(batch) -> list[int]:
+    return [r.token for r in _run_responses(batch)]
 
 
 # ---- SPD-028: the round -> plain step handoff
@@ -355,6 +359,36 @@ def test_rows_with_processors_may_round_top_logprobs_still_may_not():
     assert batch._can_round()
     batch._rows[0].top_logprobs = 1
     assert not batch._can_round()
+
+
+# ---- the cache a finished row hands off holds exactly the tokens it reports (SPD-032)
+
+@pytest.mark.parametrize("kind", ["dflash", "mtp"])
+@pytest.mark.parametrize("processors", [True, False])
+def test_a_row_finished_by_a_round_hands_off_a_cache_that_holds_exactly_its_all_tokens(monkeypatch, kind, processors):
+    batch, draft = _batch(kind, speculative_on=True, processors=processors)
+    if kind == "mtp":
+        _mtp_hooks(monkeypatch, lambda: [draft])
+    responses = _run_responses(batch)
+    last = responses[-1]
+    assert last.finish_reason == "stop" and draft.rounds_at, "the row finished inside a round"
+    assert last.all_tokens == batch.model.fed
+
+
+@pytest.mark.parametrize("kind", ["dflash", "mtp"])
+@pytest.mark.parametrize("max_tokens", [1, 7, 10, 13])
+def test_max_tokens_landing_mid_block_emits_the_plain_path_tokens_and_a_matching_cache(monkeypatch, kind, max_tokens):
+    plain_batch, _ = _batch(kind, speculative_on=False, max_tokens=max_tokens)
+    plain = _run_responses(plain_batch)
+    spec_batch, draft = _batch(kind, speculative_on=True, max_tokens=max_tokens)
+    if kind == "mtp":
+        _mtp_hooks(monkeypatch, lambda: [draft])
+    spec = _run_responses(spec_batch)
+
+    assert [r.token for r in spec] == [r.token for r in plain] and len(spec) == max_tokens
+    assert spec[-1].finish_reason == "length"
+    assert spec[-1].all_tokens == spec_batch.model.fed
+    assert plain[-1].all_tokens == plain_batch.model.fed
 
 
 def test_the_walk_stops_at_a_stop_token_instead_of_walking_past_it():
