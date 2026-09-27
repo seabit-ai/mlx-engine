@@ -211,3 +211,163 @@ def test_a_seeded_dflash_proposal_draws_with_the_target_key_for_its_position(mon
     batch, _ = world._batch("dflash", speculative_on=True, sampler=sampler, processors=False, max_tokens=60)
     batch.next()  # the pending token, then the first round at emitted = 1
     assert proposals and seen[1] == [1, 2, 3]   # seen[0] is the prefill's first draw
+
+
+# ---- the other two paths a seed can take, and the seed's range
+
+import threading
+
+from mlx_engine import generate as engine_generate
+from mlx_engine.utils.set_seed import set_seed
+
+
+class _Tok:
+    eos_token_ids = {63}
+
+    def decode(self, token):
+        return "x" if isinstance(token, int) else "x" * len(token)
+
+
+class _SequentialKit:
+    """What _sequential_generation reads from a ModelKit; the model itself is stream_generate's (faked)."""
+    draft_model = None
+    model = None
+    prefill_step_size = 512
+    tokenizer = _Tok()
+
+    def __init__(self):
+        self.pending_requests = {}
+        self.generation_lock = threading.Lock()
+
+    def is_shutdown(self):
+        return False
+
+    def process_prompt(self, prompt_tokens, *args):
+        return prompt_tokens, None
+
+    def is_cross_prompt_cache_active(self):
+        return False
+
+
+def _fake_stream_generate(*, sampler, max_tokens, **kwargs):
+    logprobs = _logprobs_after(0)
+    for _ in range(max_tokens):
+        yield SimpleNamespace(token=int(sampler(logprobs).item()) % 63, text="x", logprobs=logprobs[0],
+                              from_draft=False)
+
+
+def _sequential_tokens(monkeypatch, seed, disturb=False):
+    monkeypatch.setattr(engine_generate, "stream_generate", _fake_stream_generate)
+    if disturb:
+        mx.random.seed(12345)
+    results = engine_generate._sequential_generation(_SequentialKit(), [1, 2, 3], temp=1.0, seed=seed,
+                                                     max_tokens=24, request_id="r")
+    return [t.id for r in results for t in r.tokens]
+
+
+@pytest.mark.parametrize("seed", [0, 7, 2**63, 2**64 - 1])
+def test_the_sequential_path_takes_any_64_bit_seed_and_replays_it(monkeypatch, seed):
+    first = _sequential_tokens(monkeypatch, seed)
+    assert len(first) == 24 and _sequential_tokens(monkeypatch, seed, disturb=True) == first
+
+
+def test_on_the_sequential_path_seeds_that_differ_above_bit_31_do_not_collide(monkeypatch):
+    assert _sequential_tokens(monkeypatch, 5) != _sequential_tokens(monkeypatch, 5 + 2**32)
+
+
+def test_set_seed_takes_the_64_bit_range_and_refuses_what_is_outside_it():
+    import numpy as np
+
+    set_seed(5)
+    low = np.random.randint(0, 2**31, size=4).tolist()
+    set_seed(5 + 2**32)
+    assert np.random.randint(0, 2**31, size=4).tolist() != low
+    set_seed(2**64 - 1)
+    for bad in (-1, 2**64):
+        with pytest.raises(ValueError):
+            set_seed(bad)
+
+
+def _tiny_llama():
+    from mlx_lm.models import llama
+
+    model = llama.Model(llama.ModelArgs(model_type="llama", hidden_size=32, num_hidden_layers=2, intermediate_size=64,
+                                        num_attention_heads=4, rms_norm_eps=1e-5, vocab_size=V,
+                                        num_key_value_heads=4))
+    from mlx.utils import tree_map
+
+    model.update(tree_map(lambda p: mx.random.normal(p.shape, key=mx.random.key(3)) * 0.5,
+                                   model.parameters()))
+    mx.eval(model.parameters())
+    return model
+
+
+def _mlx_lm_batch(model, rows, steps=20):
+    from mlx_lm.generate import BatchGenerator
+
+    gen = BatchGenerator(model, max_tokens=steps, completion_batch_size=4, prefill_batch_size=1)
+    uids = gen.insert([p for p, _ in rows], [steps] * len(rows), samplers=[s for _, s in rows])
+    out = {uid: [] for uid in uids}
+    while True:
+        prompt_responses, responses = gen.next()
+        if not prompt_responses and not responses:
+            break
+        for r in responses:
+            out[r.uid].append(r.token)
+    gen.close()
+    return [out[uid] for uid in uids]
+
+
+def test_on_the_mlx_lm_batched_path_a_seeded_row_draws_the_same_alone_and_in_company():
+    # BatchedModelKit (text-only models) hands each request's sampler to mlx-lm's BatchGenerator,
+    # which calls it once per step: positions in call order
+    model = _tiny_llama()
+    alone = _mlx_lm_batch(model, [([1, 2, 3], _seeded(42))])[0]
+    crowded = _mlx_lm_batch(model, [([5, 6], _seeded(7)), ([1, 2, 3], _seeded(42)),
+                                    ([9], create_sampler(1.0, None, None, None, None))])[1]
+    other = _mlx_lm_batch(model, [([1, 2, 3], _seeded(43))])[0]
+    assert crowded == alone and len(alone) == 20
+    assert other != alone
+
+
+# ---- a consumer that stops reading takes its row out of the batch
+
+class _Response(SimpleNamespace):
+    pass
+
+
+def _batched_kit(tokens):
+    from mlx_engine.model_kit.batched_model_kit import BatchedModelKit
+
+    kit = object.__new__(BatchedModelKit)
+    kit.tokenizer = _Tok()
+    kit._shutdown = threading.Event()
+    kit._shutdown.set()  # __del__ calls shutdown(); nothing to stop here
+    kit.removed = []
+    kit.samplers = []
+
+    def generate(*, sampler, **kwargs):
+        kit.samplers.append(sampler)
+        for t in tokens:
+            yield _Response(token=t, text="x", token_logprob=0.0, top_logprobs=None, finish_reason=None,
+                            from_draft=False)
+
+    kit.generate = generate
+    kit.remove = kit.removed.append
+    return kit
+
+
+def test_closing_a_batched_generation_early_removes_its_row():
+    kit = _batched_kit([1, 2, 3, 4, 5])
+    results = engine_generate._batched_generation(kit, [1], request_id="req-1", temp=1.0, seed=9)
+    next(results)
+    results.close()
+    assert kit.removed == ["req-1"]
+    assert isinstance(kit.samplers[0], SeededSampler) and kit.samplers[0].seed == 9
+
+
+def test_a_batched_generation_read_to_the_end_removes_nothing():
+    kit = _batched_kit([1, 2, 63])
+    assert [r.stop_condition.stop_reason for r in engine_generate._batched_generation(kit, [1], request_id="r")
+            if r.stop_condition] == ["eos_token"]
+    assert kit.removed == []

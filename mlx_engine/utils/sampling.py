@@ -178,8 +178,13 @@ class SeededSampler:
         )
 
     def __call__(self, logprobs: mx.array) -> mx.array:
-        rows = 1 if logprobs.ndim == 1 else logprobs.shape[0]
+        """Any leading shape ([V], [N, V], [1, N, V] from mlx-lm's speculative loop): one position per row."""
+        lead = logprobs.shape[:-1]
+        rows = 1
+        for n in lead:
+            rows *= n
         positions = range(self._next_position, self._next_position + rows)
         self._next_position += rows
-        drawn = self.sample_target(logprobs, row_ids=[0] * rows, positions=positions)
-        return drawn.reshape(-1) if logprobs.ndim > 1 else drawn.reshape(())
+        drawn = self.sample_target(logprobs.reshape(rows, logprobs.shape[-1]), row_ids=[0] * rows,
+                                   positions=positions)
+        return drawn.reshape(lead)

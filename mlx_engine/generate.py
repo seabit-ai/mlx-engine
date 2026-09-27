@@ -561,8 +561,9 @@ def _sequential_generation(
         )
 
         # Set up sampler
+        # seeded: draws keyed by position in call order (one per token without a draft model)
         generate_args["sampler"] = create_sampler(
-            temp, top_p, min_p, min_tokens_to_keep, top_k
+            temp, top_p, min_p, min_tokens_to_keep, top_k, seed=seed
         )
 
         # Validate top_logprobs
@@ -715,13 +716,8 @@ def _batched_generation(
     # Validate top_logprobs
     top_logprobs = validate_top_logprobs(top_logprobs)
 
-    # Keep track of tokens buffered by detokenizer to yield accurate generation results
-    token_buffer: List[Token] = []
-    top_logprobs_buffer: List[List[Token]] = []
-
     # Set up stop string processor if non-empty stop_strings are provided
     stop_string_processor = create_stop_string_processor(stop_strings, tokenizer)
-    text = ""
 
     logits_processors = setup_repetition_logits_processors(
         repetition_penalty,
@@ -816,6 +812,19 @@ def _batched_generation(
             top_logprobs=top_logprobs,
         )
 
+    try:
+        yield from _batched_results(model_kit, stream, tokenizer, stop_string_processor, top_logprobs, request_id)
+    except GeneratorExit:
+        # the consumer stopped reading (a client that went away, a stop matched downstream): take the
+        # row out of the batch, or it decodes on to EOS / max_tokens and shares every step with the next request
+        model_kit.remove(request_id)
+        raise
+
+
+def _batched_results(model_kit, stream, tokenizer, stop_string_processor, top_logprobs, request_id):
+    token_buffer: List[Token] = []
+    top_logprobs_buffer: List[List[Token]] = []
+    text = ""
     while True:
         try:
             generation_result: BatchedGenerationResponse = next(stream)
