@@ -89,6 +89,7 @@ def create_sampler(
     min_p: Optional[float],
     min_tokens_to_keep: Optional[int],
     top_k: Optional[int],
+    seed: Optional[int] = None,
 ):
     temp = 0.0 if temp is None else temp
     top_p = 0.0 if top_p is None else top_p
@@ -104,15 +105,81 @@ def create_sampler(
         greedy.greedy = True  # speculative decoding verifies greedy rows with the fused argmax
         return greedy
 
-    # Avoid mlx_lm.make_sampler's module-global compiled random helpers: they
-    # capture thread-local PRNG state before batched worker threads call them.
-    def sampler(logprobs):
+    def truncate(logprobs):
         if top_p > 0 and top_p < 1.0:
             logprobs = _apply_top_p(logprobs, top_p)
         if min_p != 0.0:
             logprobs = _apply_min_p(logprobs, min_p, min_tokens_to_keep)
         if top_k > 0:
             logprobs = _apply_top_k(logprobs, top_k)
-        return mx.random.categorical(logprobs * (1 / temp))
+        return logprobs
+
+    if seed is not None:
+        return SeededSampler(seed, truncate, temp)
+
+    # Avoid mlx_lm.make_sampler's module-global compiled random helpers: they
+    # capture thread-local PRNG state before batched worker threads call them.
+    def sampler(logprobs):
+        return mx.random.categorical(truncate(logprobs) * (1 / temp))
 
     return sampler
+
+
+_MASK64 = (1 << 64) - 1
+
+
+def _splitmix64(x: int) -> int:
+    x = (x + 0x9E3779B97F4A7C15) & _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return x ^ (x >> 31)
+
+
+def position_key(seed: int, position: int) -> mx.array:
+    """The PRNG key for one request's draw at one generated position: a pure function of
+    (seed, position), so no other request and no earlier call can move it."""
+    return mx.random.key(_splitmix64((seed & _MASK64) ^ _splitmix64(position)))
+
+
+class SeededSampler:
+    """One request's sampler with its own randomness: the token at generated position p is drawn
+    with position_key(seed, p) — counter-based, not a stream. That makes a row's draws independent
+    of the other rows in the batch and of how the decode loop reached p: a plain step, a
+    speculative verify walk and a drafter proposal for position p all use the same key. The
+    verify walks call `sample_target` with explicit positions (mlx-vlm's positioned-sampler
+    protocol); a caller that knows no positions calls the sampler and gets 0, 1, 2, ... in call
+    order (mlx-lm's batch generator draws once per emitted token, so that is the position)."""
+
+    def __init__(self, seed: int, truncate, temp: float):
+        self.seed = int(seed)
+        self._truncate = truncate
+        self._inv_temp = 1 / temp
+        self._next_position = 0
+
+    def _draw(self, logprobs: mx.array, position: int) -> mx.array:
+        return mx.random.categorical(
+            self._truncate(logprobs) * self._inv_temp,
+            key=position_key(self.seed, position),
+        )
+
+    def sample_target(self, logprobs: mx.array, *, row_ids, positions) -> mx.array:
+        """logprobs [N, V], one row per position; row_ids name batch rows in mlx-vlm's protocol and
+        are ignored here — this sampler belongs to one request."""
+        positions = [int(p) for p in positions]
+        if logprobs.ndim == 1:
+            logprobs = logprobs[None]
+        if logprobs.shape[0] != len(positions):
+            raise ValueError(
+                f"{logprobs.shape[0]} rows of logprobs for {len(positions)} positions"
+            )
+        return mx.concatenate(
+            [self._draw(logprobs[i : i + 1], p) for i, p in enumerate(positions)],
+            axis=0,
+        )
+
+    def __call__(self, logprobs: mx.array) -> mx.array:
+        rows = 1 if logprobs.ndim == 1 else logprobs.shape[0]
+        positions = range(self._next_position, self._next_position + rows)
+        self._next_position += rows
+        drawn = self.sample_target(logprobs, row_ids=[0] * rows, positions=positions)
+        return drawn.reshape(-1) if logprobs.ndim > 1 else drawn.reshape(())

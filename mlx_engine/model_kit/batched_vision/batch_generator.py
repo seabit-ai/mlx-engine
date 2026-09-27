@@ -239,11 +239,18 @@ def _capture_rope_deltas(
 def _sample_with_samplers(
     logprobs: mx.array,
     samplers: list[Callable[[mx.array], mx.array]],
+    positions: Optional[list[int]] = None,
 ) -> mx.array:
-    return mx.concatenate(
-        [sampler(logprobs[i : i + 1]) for i, sampler in enumerate(samplers)],
-        axis=0,
-    )
+    """`positions`: each row's generated-token index for this draw; a seeded sampler
+    (utils/sampling.SeededSampler) keys its draw by it, the others ignore it."""
+    drawn = []
+    for i, sampler in enumerate(samplers):
+        sample_target = getattr(sampler, "sample_target", None)
+        if positions is not None and callable(sample_target):
+            drawn.append(sample_target(logprobs[i : i + 1], row_ids=[0], positions=[positions[i]]))
+        else:
+            drawn.append(sampler(logprobs[i : i + 1]))
+    return mx.concatenate(drawn, axis=0)
 
 
 def _apply_logits_processors(
@@ -329,8 +336,9 @@ def _sample_next_token(
     logprobs: mx.array,
     samplers: list[Callable[[mx.array], mx.array]],
     top_logprobs_k: int,
+    positions: Optional[list[int]] = None,
 ) -> tuple[mx.array, mx.array, mx.array | None, mx.array | None]:
-    sampled = _sample_with_samplers(logprobs, samplers)
+    sampled = _sample_with_samplers(logprobs, samplers, positions)
     token_logprobs = logprobs[mx.arange(sampled.shape[0]), sampled]
     top_idx, top_logprobs = _top_logprobs(logprobs, top_logprobs_k)
     return sampled, token_logprobs, top_idx, top_logprobs
@@ -482,6 +490,11 @@ class GenerationBatch:
         logits = output.logits if hasattr(output, "logits") else output
         return logits[:, -1, :]
 
+    def _draw_positions(self) -> list[int]:
+        """The generated-token index each row draws in _advance: decode-ahead feeds the
+        token about to be emitted (index num_tokens) and draws the one after it."""
+        return [row.num_tokens + 1 for row in self._rows]
+
     def _advance(self, inputs: mx.array) -> None:
         """Feed one token per row and sample the next (kept as _next_*, not emitted)."""
         fwd_kwargs = {}
@@ -510,6 +523,7 @@ class GenerationBatch:
             logprobs,
             [row.sampler for row in self._rows],
             self.top_logprobs_k,
+            self._draw_positions(),
         )
 
         self._next_tokens = sampled
@@ -1088,7 +1102,7 @@ class _PromptPrefill:
             )
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens, first_logprobs, top_idx, top_logprobs = _sample_next_token(
-            logprobs, [self.sampler], self.top_logprobs
+            logprobs, [self.sampler], self.top_logprobs, positions=[0]
         )
 
         gen_batch = GenerationBatch(

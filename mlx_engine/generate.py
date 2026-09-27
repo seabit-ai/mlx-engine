@@ -693,7 +693,7 @@ def _batched_generation(
     top_k: Optional[int] = None,
     min_p: Optional[float] = None,
     min_tokens_to_keep: Optional[int] = None,
-    seed: Optional[int] = None,  # Seed arg is ignored for batched gen
+    seed: Optional[int] = None,  # per request: this request's draws only (utils/sampling.SeededSampler)
     json_schema: Optional[str] = None,
     max_tokens: Optional[int] = 10000000,
     speculative_decoding_toggle: Optional[bool] = None,
@@ -729,7 +729,7 @@ def _batched_generation(
         prompt_tokens,
         input_tokens,
     )
-    sampler = create_sampler(temp, top_p, min_p, min_tokens_to_keep, top_k)
+    sampler = create_sampler(temp, top_p, min_p, min_tokens_to_keep, top_k, seed=seed)
 
     if isinstance(model_kit, BatchedVisionModelKit):
         # `max_image_size` is legacy-only; batched VLM lets mlx-vlm processors resize.

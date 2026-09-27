@@ -22,7 +22,7 @@ import mlx.core as mx
 from mlx_vlm.speculative import mtp as _mtp
 from mlx_vlm.speculative.common import _record_speculative_round, generation_stream
 from mlx_vlm.speculative.common import _dflash_block_total, _record_speculative_round, _speculative_walk
-from mlx_vlm.speculative.dflash import _dflash_next_block_size, _sample_dflash_target_walk
+from mlx_vlm.speculative.dflash import _PositionedDraftSampler, _dflash_next_block_size, _sample_dflash_target_walk
 from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
 from mlx_engine.model_kit.patches.qwen3_5 import GdnVerifyRecorder, mark_gdn_convs_for_verify_recording
@@ -321,6 +321,8 @@ def speculative_round(
                 draft_tokens[i : i + 1],
                 samplers[i],
                 [budgets[i]],
+                row_ids=[0],
+                base_positions=[emitted[i] if emitted else 0],
             )
             walked_rows[i] = walked[0]
 
@@ -374,7 +376,13 @@ def dflash_round(
     seen yet ([1, n, dim]); the result's `hidden` is the next one (the block's accepted part)."""
     lm = _language_model(model)
     greedy = bool(getattr(sampler, "greedy", False))
-    draft_sampler = (lambda logits: mx.argmax(logits, axis=-1).astype(TOKEN_DTYPE)) if greedy else sampler
+    if greedy:
+        draft_sampler = lambda logits: mx.argmax(logits, axis=-1).astype(TOKEN_DTYPE)  # noqa: E731
+    elif callable(getattr(sampler, "sample_target", None)):
+        # a seeded row: the proposal for position p draws with the key the target draws p with
+        draft_sampler = _PositionedDraftSampler(sampler, row_ids=[0], positions=[emitted])
+    else:
+        draft_sampler = sampler
     draft_tokens = drafter.model.draft_block(bonus, context, draft_cache, block_size, draft_sampler, TOKEN_DTYPE)
     verify_input = mx.concatenate([mx.array([[bonus]], dtype=TOKEN_DTYPE), draft_tokens.astype(TOKEN_DTYPE)], axis=1)
     with mx.stream(generation_stream):
@@ -541,6 +549,10 @@ class SpeculativeGenerationBatch(GenerationBatch):
         if all(self._pending):
             return super().next()
         return self._plain_tick()
+
+    def _draw_positions(self) -> list[int]:
+        # a row whose last token went out with a round already counted it: the draw is num_tokens
+        return [row.num_tokens + (1 if pending else 0) for row, pending in zip(self._rows, self._pending)]
 
     def _plain_tick(self) -> list[GenerationBatch.Response]:
         """A plain step for a batch where some rows' last token already went out with
