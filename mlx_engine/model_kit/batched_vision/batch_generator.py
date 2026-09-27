@@ -46,6 +46,12 @@ from mlx_engine.processors.repetition_penalty_processor import (
     RepetitionPenaltyProcessor,
 )
 from mlx_engine.tool_runtime import NativeToolReasoningGuardLogitsProcessor
+from mlx_engine.model_kit.batched_vision.context_check import (
+    ContextCheck,
+    SurpriseMeter,
+    projection_for,
+    take_final_hidden,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +102,7 @@ class _PendingSequence:
     prefix_cache_save_state: _PrefixCacheSaveState
     speculative: bool = True
     draft_tokens: Optional[int] = None
+    context_check: Optional[ContextCheck] = None
 
 
 def _batch_single_cache(cache: list[Any]) -> list[Any]:
@@ -812,9 +819,15 @@ class _PromptPrefill:
         draft_tokens: Optional[int] = None,
         want_hidden: bool = False,
         drafter: Any = None,
+        context_check: Optional[ContextCheck] = None,
     ):
         self.model = model
         self.uid = uid
+        self._meter = (
+            SurpriseMeter(input_ids, context_check, projection_for(model))
+            if context_check is not None
+            else None
+        )
         self.speculative = speculative
         self.draft_tokens = draft_tokens
         # A drafter needs target states from the prompt: an MTP head the last layer's state of
@@ -876,6 +889,10 @@ class _PromptPrefill:
         dflash = self.drafter is not None and getattr(self.drafter, "is_dflash", False)
         if dflash:
             prompt_kwargs.update(self.drafter.capture_kwargs())
+        segment_start = self._processed_prefix_len - len(self._all_tokens)
+        check_hidden = self._meter is not None and self._meter.wants(segment_start, n)
+        if check_hidden:
+            prompt_kwargs["return_hidden"] = True
         try:
             output = self.model(
                 self._input_ids[:, :n],
@@ -885,6 +902,8 @@ class _PromptPrefill:
             )
         finally:
             _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
+        if check_hidden:
+            self._meter.add(segment_start, take_final_hidden(output, added=True))
         if dflash:
             self._keep_context_tail(self.drafter.hidden_from(output))
         mx.eval([c.state for c in self.prompt_cache])
@@ -1073,6 +1092,11 @@ class _PromptPrefill:
             prompt_kwargs.update(self.drafter.capture_kwargs())
         elif self.want_hidden:
             prompt_kwargs["return_hidden"] = True
+        segment_start = self._processed_prefix_len - len(self._all_tokens)
+        check_hidden = self._meter is not None and self._meter.wants(segment_start, self._inputs_embeds.shape[1])
+        added_hidden = check_hidden and not prompt_kwargs.get("return_hidden")
+        if added_hidden:
+            prompt_kwargs["return_hidden"] = True
         _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
         try:
             output = self.model(
@@ -1083,6 +1107,8 @@ class _PromptPrefill:
             )
         finally:
             _clear_qwen3_5_text_rope_state(self.model, prompt_kwargs)
+        if check_hidden:
+            self._meter.add(segment_start, take_final_hidden(output, added=added_hidden))
         last_hidden = None
         if dflash:
             self._keep_context_tail(self.drafter.hidden_from(output))
@@ -1280,6 +1306,7 @@ class BatchGenerator:
         prompt_cache_save_callback: Optional[PromptCacheSaveCallback] = None,
         speculative: bool = True,
         draft_tokens: Optional[int] = None,
+        context_check: Optional[ContextCheck] = None,
     ) -> int:
         uid = self.uid_count
         self.uid_count += 1
@@ -1308,6 +1335,7 @@ class BatchGenerator:
                 ),
                 speculative=speculative,
                 draft_tokens=draft_tokens,
+                context_check=context_check,
             )
         )
         return uid
@@ -1389,6 +1417,7 @@ class BatchGenerator:
                 draft_tokens=sequence.draft_tokens,
                 want_hidden=self.drafter is not None,
                 drafter=self.drafter,
+                context_check=sequence.context_check,
             )
 
             if self._prompt_batch.needs_processing():

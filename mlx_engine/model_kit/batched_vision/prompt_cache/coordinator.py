@@ -37,6 +37,8 @@ class RestoredPromptCache:
     cached_prefix_len: int
     prompt_cache: list[Any]
     rope_deltas: Any | None
+    source: str = "disk"        # "hot" / "disk": where the prefix came from (lmk context check)
+    trimmed_tokens: int = 0     # hot: tokens cut off the end of the held cache to fit this prompt
 
 
 @dataclass
@@ -249,6 +251,8 @@ class VlmPromptCacheCoordinator:
             cached_prefix_len=plan.cached_prefix_len,
             prompt_cache=entry.prompt_cache,
             rope_deltas=None if trim_count > 0 else entry.rope_deltas,
+            source="hot",
+            trimmed_tokens=max(0, trim_count),
         )
 
     def _load_disk_restore_plan(

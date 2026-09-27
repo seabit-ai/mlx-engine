@@ -121,7 +121,8 @@ def test_load_model_forces_no_trust_remote_code(monkeypatch, tmp_path):
 
 def test_insert_reports_full_prepared_prompt_length(monkeypatch):
     class FakeBatchGenerator:
-        def insert(self, *_args, **_kwargs):
+        def insert(self, *_args, **kwargs):
+            assert kwargs["context_check"].restore_source == "none"
             return 7
 
     monkeypatch.setattr(
@@ -180,6 +181,10 @@ def test_insert_reports_full_prepared_prompt_length(monkeypatch):
     assert progress.total_prompt_tokens == 3
     assert progress.cached_tokens == 0
     assert active[7].request_id == "request"
+    # lmk context check: a cold request's record is kept for the caller, handed to the batcher, popped once
+    check = kit.pop_context_check("request")
+    assert (check["restore_source"], check["restored_tokens"], check["scored_tokens"]) == ("none", 0, 0)
+    assert kit.pop_context_check("request") is None
 
 
 def test_generate_fatal_error_preserves_state_for_exception_propagation(monkeypatch):

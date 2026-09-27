@@ -4,9 +4,10 @@ import logging
 import sys
 import time
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 from queue import Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Callable, Iterable
 
 import mlx.core as mx
@@ -35,6 +36,7 @@ from mlx_engine.model_kit.batched_vision.prompt_cache.chunks import (
     first_unsaved_prefix_cache_chunk_index,
 )
 from mlx_engine.model_kit.batched_vision.kv_quant import KVQuantParams
+from mlx_engine.model_kit.batched_vision.context_check import ContextCheck
 from mlx_engine.model_kit.batched_vision.prompt_cache.cache_store import (
     VlmPromptCacheStore,
 )
@@ -108,6 +110,14 @@ def _restore_splits_gemma4_image_span(
     if not uses_visual_prefill_policy or cached_prefix_len <= 0:
         return False
     return any(span.start < cached_prefix_len < span.end for span in image_spans)
+
+
+# Checks nobody collected (a caller that never asks) are dropped oldest first.
+CONTEXT_CHECKS_KEPT = 64
+
+# Test hook (lmk itest for the context check): called with every RestoredPromptCache before it is used, so a
+# test can corrupt a restored state and see the check catch it. None in production.
+RESTORED_CACHE_HOOK: Callable | None = None
 
 
 class BatchedVisionModelKit:
@@ -525,6 +535,8 @@ class BatchedVisionModelKit:
             request.rqueue.put(error)
             return
 
+        if restored is not None and RESTORED_CACHE_HOOK is not None:
+            RESTORED_CACHE_HOOK(restored)
         if restored is not None and _restore_splits_gemma4_image_span(
             model_type=self.model_type,
             cached_prefix_len=restored.cached_prefix_len,
@@ -608,6 +620,12 @@ class BatchedVisionModelKit:
                 ),
             )
 
+        context_check = ContextCheck(
+            restore_source="none" if restored is None else restored.source,
+            restored_tokens=cached_prefix_len,
+            hot_trimmed_tokens=0 if restored is None else restored.trimmed_tokens,
+        )
+        self._keep_context_check(request.request_id, context_check)
         uid = batch_generator.insert(
             prompt_input_ids,
             inputs_embeds=inputs_embeds,
@@ -626,6 +644,7 @@ class BatchedVisionModelKit:
             prompt_cache_save_callback=prompt_cache_save_callback,
             speculative=getattr(request, "speculative", True),
             draft_tokens=getattr(request, "draft_tokens", None),
+            context_check=context_check,
         )
 
         active[uid] = ActiveRequest(
@@ -636,6 +655,22 @@ class BatchedVisionModelKit:
             image_spans=prepared_prompt.image_spans,
             cached_tokens=cached_tokens,
         )
+
+    _context_checks_lock = Lock()  # class-wide: guards each kit's _context_checks, created on first use
+
+    def _keep_context_check(self, request_id, check: ContextCheck) -> None:
+        with self._context_checks_lock:
+            checks = self.__dict__.setdefault("_context_checks", OrderedDict())
+            checks[str(request_id)] = check
+            while len(checks) > CONTEXT_CHECKS_KEPT:
+                checks.popitem(last=False)
+
+    def pop_context_check(self, request_id) -> dict | None:
+        """The request's context check (context_check.py), once its prefill is done; None if unknown.
+        Filled by the generation thread before the request's first token is emitted."""
+        with self._context_checks_lock:
+            check = self.__dict__.get("_context_checks", {}).pop(str(request_id), None)
+        return None if check is None else check.summary()
 
     def _emit_response(
         self, result: ActiveRequest, response
