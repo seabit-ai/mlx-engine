@@ -691,19 +691,21 @@ def _patched_vlm_qwen3_5_language_model_call(
             kwargs["position_ids"] = position_ids
 
     if text_only and position_ids is None:
-        out = self.model(
+        hidden = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=None,
         )
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            out = self.model.embed_tokens.as_linear(hidden)
         else:
-            out = self.lm_head(out)
+            out = self.lm_head(hidden)
+        # return_hidden was dropped on this path (a restored text prompt takes it): the final-layer states, as
+        # the original call returns them, for the context check and an MTP drafter's first round
         return LanguageModelOutput(
             logits=out,
-            hidden_states=None,
+            hidden_states=[hidden] if kwargs.get("return_hidden") else None,
             gdn_states=None,
         )
 

@@ -60,12 +60,12 @@ def _expected(segment, tail):
     return [logprobs[segment[i], segment[i + 1]].item() for i in range(max(0, end - tail), end)]
 
 
-def _prefill(segment, step, tail=None, monkeypatch=None, model=None, drafter=None, prefix=()):
+def _prefill(segment, step, tail=None, monkeypatch=None, model=None, drafter=None, prefix=(), targets=None):
     if tail is not None:
         monkeypatch.setattr(batcher, "SurpriseMeter",
                             lambda seg, check, project: SurpriseMeter(seg, check, project, tail=tail))
     model = model or _Model()
-    check = ContextCheck(restore_source="disk", restored_tokens=0)
+    check = ContextCheck(restore_source="disk", restored_tokens=0, targets=targets)
     prefill = batcher._PromptPrefill(
         model=model, uid=1, input_ids=list(segment), max_tokens=1, top_logprobs=0,
         sampler=lambda lp: mx.argmax(lp, axis=-1), logits_processors=[],
@@ -147,3 +147,25 @@ def test_a_hot_restore_says_so_and_how_much_it_trimmed():
                                  rope_deltas=None)
     restored = coordinator._load_hot_restore_plan(_HotRestoreCandidate(entry=entry, cached_prefix_len=7))
     assert (restored.source, restored.trimmed_tokens, restored.cached_prefix_len) == ("hot", 3, 7)
+
+
+def test_named_targets_are_scored_wherever_they_are_and_only_they(monkeypatch):
+    targets = [2, 3, 9, 13, 40]            # 40 is past the segment; 13 is its last token, predicted by position 12
+    check, model = _prefill(SEGMENT, 4, targets=targets)
+    lp = TABLE - mx.logsumexp(TABLE, axis=-1, keepdims=True)
+    assert check.logprobs == pytest.approx([lp[SEGMENT[t - 1], SEGMENT[t]].item() for t in (2, 3, 9, 13)], abs=1e-5)
+    assert [c["return_hidden"] for c in model.calls] == [True, False, True, True]   # chunks 0-3, 4-7, 8-11, 12-13
+    assert check.summary()["scored"] == "targets"
+
+
+def test_the_plain_lm_head_is_preferred_to_the_exact_verifier_projection():
+    from mlx_engine.model_kit.batched_vision.context_check import projection_for
+
+    head = lambda h: h  # noqa: E731
+    model = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=False), lm_head=head,
+                            speculative_logits_from_hidden=lambda h: None)
+    assert projection_for(model) is head
+    own = lambda h: h * 0  # noqa: E731
+    capped = SimpleNamespace(args=SimpleNamespace(final_logit_softcapping=30.0), lm_head=head,
+                             speculative_logits_from_hidden=own)
+    assert projection_for(capped) is own    # a softcap is part of the logits: the model's own method applies it

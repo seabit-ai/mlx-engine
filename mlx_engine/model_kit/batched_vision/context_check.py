@@ -14,6 +14,7 @@ import mlx.core as mx
 # that computes the hidden states anyway. A cap, not a measured optimum — the cost per token is written down
 # in lmk research/2026-09-26-context-check; the tail is where the new turn is, next to what the model writes.
 TAIL_TOKENS = 512
+PROJECTION_BLOCK = 128
 
 
 @dataclass
@@ -25,10 +26,12 @@ class ContextCheck:
     logprobs: list = field(default_factory=list)
     ms: float = 0.0                   # time spent scoring (projection + reduction), not the prefill itself
     unsupported: Optional[str] = None
+    targets: Optional[list] = None    # segment token indices to score (the caller's choice); None = the tail
 
     def summary(self) -> dict:
         out = {"restore_source": self.restore_source, "restored_tokens": self.restored_tokens,
                "hot_trimmed_tokens": self.hot_trimmed_tokens, "segment_tokens": self.segment_tokens,
+               "scored": "tail" if self.targets is None else "targets",
                "scored_tokens": len(self.logprobs), "ms": round(self.ms, 1), "unsupported": self.unsupported}
         if self.logprobs:
             surprise = sorted(-lp for lp in self.logprobs)
@@ -39,7 +42,9 @@ class ContextCheck:
 
 
 class SurpriseMeter:
-    """Scores the tail of one request's segment, chunk by chunk as the prefill calls the model.
+    """Scores one request's segment, chunk by chunk as the prefill calls the model: the tokens the caller named
+    (lmk names the model's own earlier turns — the only text an instruction-tuned model was trained to predict,
+    research 2026-09-26-context-check exp03/exp04), else the segment's tail.
     Position i of the segment predicts token i+1; the segment's last position predicts the first generated
     token and is not scored, nor is the segment's first token (predicted by the restored prefix, whose last
     hidden state is not at hand)."""
@@ -51,32 +56,48 @@ class SurpriseMeter:
         self._project = project
         check.segment_tokens = len(segment)
         end = len(segment) - 1                      # positions [0, end) have their next token in the segment
-        self._lo, self._hi = max(0, end - tail), max(0, end)
+        if check.targets is None:
+            self._positions = list(range(max(0, end - tail), max(0, end)))
+        else:  # the caller's targets (the latest `tail` of them): position t-1 predicts target t
+            self._positions = [t - 1 for t in check.targets if 1 <= t <= end][-tail:]
         if project is None and check.unsupported is None:
             check.unsupported = "the model exposes no projection from hidden states"
 
     def wants(self, start: int, n: int) -> bool:
-        return self._project is not None and start < self._hi and start + n > self._lo
+        return self._project is not None and any(start <= p < start + n for p in self._positions)
 
     def add(self, start: int, hidden: Optional[Any]) -> None:
         """hidden: the final-layer states for segment positions [start, start + n), shape [1, n, H]."""
         if hidden is None or self._project is None:
             return
         n = hidden.shape[1]
-        first, last = max(start, self._lo), min(start + n, self._hi)
-        if first >= last:
+        positions = [p for p in self._positions if start <= p < start + n]
+        if not positions:
             return
+        rows = hidden[:, mx.array([p - start for p in positions]), :]
+        mx.eval(rows)  # the chunk's forward: the prefill's cost, not the check's — keep it out of `ms`
         began = time.perf_counter()
-        rows = hidden[:, first - start : last - start, :]
-        logits = self._project(rows).reshape(last - first, -1).astype(mx.float32)
-        targets = mx.array(self._segment[first + 1 : last + 1], dtype=mx.int32)
-        picked = mx.take_along_axis(logits, targets[:, None], axis=-1)[:, 0]
-        logprobs = picked - mx.logsumexp(logits, axis=-1)
-        self.check.logprobs.extend(logprobs.tolist())
+        targets = mx.array([self._segment[p + 1] for p in positions], dtype=mx.int32)
+        # blocks of rows: a float32 row of a 248k vocabulary is 1 MB, 512 of them at once would be 0.5 GB
+        for b in range(0, len(positions), PROJECTION_BLOCK):
+            block = rows[:, b : b + PROJECTION_BLOCK]
+            logits = self._project(block).reshape(block.shape[1], -1).astype(mx.float32)
+            picked = mx.take_along_axis(logits, targets[b : b + PROJECTION_BLOCK, None], axis=-1)[:, 0]
+            self.check.logprobs.extend((picked - mx.logsumexp(logits, axis=-1)).tolist())
         self.check.ms += (time.perf_counter() - began) * 1000
 
 
 def projection_for(model: Any) -> Optional[Callable[[mx.array], mx.array]]:
+    """The plain lm_head (or tied embedding) where the logits are just that: 78 ms for 512 rows on the 27B, where
+    speculative_logits_from_hidden goes through mlx-vlm's exact verifier at 545–585 ms (lmk research
+    2026-09-26-context-check exp01). Models that post-process logits (a softcap) keep their own method."""
+    args = getattr(model, "args", None)
+    softcap = getattr(args, "final_logit_softcapping", None)
+    if not softcap:
+        if getattr(args, "tie_word_embeddings", False) and hasattr(getattr(model, "model", None), "embed_tokens"):
+            return model.model.embed_tokens.as_linear
+        if callable(getattr(model, "lm_head", None)):
+            return model.lm_head
     project = getattr(model, "speculative_logits_from_hidden", None)
     return project if callable(project) else None
 

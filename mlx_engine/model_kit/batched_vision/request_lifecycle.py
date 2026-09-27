@@ -35,6 +35,7 @@ class GenerationRequest:
     max_tokens: int
     speculative: bool = True
     draft_tokens: int | None = None
+    context_check_targets: list[int] | None = None  # prompt token indices to score (context_check.py); None = the tail
 
 
 @dataclass

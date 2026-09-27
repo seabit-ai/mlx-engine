@@ -330,6 +330,7 @@ class BatchedVisionModelKit:
         logits_processors: list,
         speculative_decoding_toggle: bool | None = None,
         num_draft_tokens: int | None = None,
+        context_check_targets: list[int] | None = None,
     ):
         if self._shutdown.is_set():
             raise RuntimeError("Cannot accept new requests when model is shutdown")
@@ -353,6 +354,7 @@ class BatchedVisionModelKit:
                 max_tokens=max_tokens,
                 speculative=speculative_decoding_toggle is not False,
                 draft_tokens=num_draft_tokens,
+                context_check_targets=context_check_targets,
             )
         )
 
@@ -625,6 +627,10 @@ class BatchedVisionModelKit:
             restored_tokens=cached_prefix_len,
             hot_trimmed_tokens=0 if restored is None else restored.trimmed_tokens,
         )
+        targets = getattr(request, "context_check_targets", None)
+        if targets is not None and not prepared_prompt.image_spans:
+            # prompt indices -> the segment's own; a target must have a position before it in the segment
+            context_check.targets = sorted({t - cached_prefix_len for t in targets if t - cached_prefix_len >= 1})
         self._keep_context_check(request.request_id, context_check)
         uid = batch_generator.insert(
             prompt_input_ids,
