@@ -653,6 +653,20 @@ def _vlm_qwen3_5_batched_left_padding_position_ids(
     return mx.add(position_ids, offsets)
 
 
+def _vlm_qwen3_5_text_position_ids(cache, fa_idx: int, batch_size: int, seq_length: int, dtype) -> mx.array | None:
+    """Positions for a text-only call from the full-attention cache's offset: what the fast path's mlx-lm modules use
+    implicitly. None without a cache to read them from."""
+    if cache is None or fa_idx >= len(cache) or cache[fa_idx] is None:
+        return None
+    offset = getattr(cache[fa_idx], "offset", None)
+    if offset is None:
+        return None
+    position_ids = mx.broadcast_to(mx.arange(seq_length, dtype=dtype).reshape(1, -1), (batch_size, seq_length))
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        return mx.add(position_ids, mx.maximum(offset[:batch_size], 0).reshape(-1, 1).astype(dtype))
+    return mx.add(position_ids, int(offset))
+
+
 def _patched_vlm_qwen3_5_language_model_call(
     self,
     inputs: mx.array,
@@ -708,6 +722,21 @@ def _patched_vlm_qwen3_5_language_model_call(
             hidden_states=[hidden] if kwargs.get("return_hidden") else None,
             gdn_states=None,
         )
+
+    text_but_captured = capture_layer_ids is not None and _is_vlm_qwen3_5_text_only(
+        mask=mask, position_ids=position_ids, pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw, capture_layer_ids=None, rope_deltas_kw=rope_deltas_kw,
+        stored_position_ids=getattr(self, "_position_ids", None), stored_rope_deltas=getattr(self, "_rope_deltas", None))
+    if text_but_captured:
+        # A text call that asks for captured layers (a DFlash drafter) cannot take the fast path and goes to mlx-vlm's
+        # own call, which — with no stored RoPE state, as after every prefill clears it — numbers the positions from
+        # 0 whatever the cache holds. After a restored prefix that put the new segment's queries and keys at the
+        # start of the conversation (lmk research 2026-09-26-sampling-seed exp01: first-token TV 0.3 against a
+        # plain forward). Give it the positions the fast path would use.
+        text_positions = _vlm_qwen3_5_text_position_ids(cache, self.model.fa_idx, inputs.shape[0], inputs.shape[1],
+                                                        mx.int32)
+        if text_positions is not None:
+            kwargs["position_ids"] = text_positions
 
     if rope_deltas_kw is not None:
         # mlx-vlm gates kwarg rope_deltas on this side state during decode.
