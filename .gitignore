@@ -2,3 +2,6 @@ __pycache__/
 .venv*/
 .DS_Store
 .idea
+
+# lmk's Makefile checkout stamp (lmk Makefile: $(ENGINE)/.pinned)
+.pinned
