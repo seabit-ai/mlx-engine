@@ -22,6 +22,9 @@ class ContextCheck:
     restore_source: str               # "none" (cold) / "hot" (the in-memory cache of the last request) / "disk"
     restored_tokens: int              # prefix tokens that came from that source (the checkpoint the restore landed on)
     hot_trimmed_tokens: int = 0       # hot restores: tokens trimmed off the end of the held cache to fit this prompt
+    matched_tokens: Optional[int] = None  # indexed-chunk token match, checkpoints ignored; None = probe failed.
+                                          # matched << prompt: the prompt diverged there; restored << matched:
+                                          # retention or checkpoint granularity (lmk research 2026-10-09 PCM-007)
     segment_tokens: int = 0           # tokens prefilled for this request (the uncached segment)
     logprobs: list = field(default_factory=list)
     ms: float = 0.0                   # time spent scoring (projection + reduction), not the prefill itself
@@ -30,7 +33,8 @@ class ContextCheck:
 
     def summary(self) -> dict:
         out = {"restore_source": self.restore_source, "restored_tokens": self.restored_tokens,
-               "hot_trimmed_tokens": self.hot_trimmed_tokens, "segment_tokens": self.segment_tokens,
+               "hot_trimmed_tokens": self.hot_trimmed_tokens, "matched_tokens": self.matched_tokens,
+               "segment_tokens": self.segment_tokens,
                "scored": "tail" if self.targets is None else "targets",
                "scored_tokens": len(self.logprobs), "ms": round(self.ms, 1), "unsupported": self.unsupported}
         if self.logprobs:

@@ -178,6 +178,36 @@ class VlmPromptCacheStore:
 
         return None
 
+    def matched_prefix_tokens(
+        self,
+        prompt_input_ids: list[int],
+        image_spans: list[PromptImageSpan],
+    ) -> int:
+        """Return how many prompt tokens are covered by indexed chunk records.
+
+        Pure token identity against the committed index: checkpoint-boundary and
+        window availability are ignored, so this can exceed what a restore plan
+        serves. Read next to the restored length, it names the failure mode of a
+        miss: matched far below the prompt length means the prompt itself
+        diverged from everything cached at that offset; restored far below
+        matched means retention or checkpoint granularity.
+        """
+        if self._layout is None:
+            return 0
+        max_reusable_prefix_len = len(prompt_input_ids) - 1
+        matched = 0
+        for chunk in build_prefix_cache_chunks(prompt_input_ids, image_spans):
+            if chunk.end > max_reusable_prefix_len:
+                break
+            if not any(
+                make_record_key(chunk.key, record_kind)
+                in self._record_metadata_by_key
+                for record_kind in RECORD_WRITE_ORDER
+            ):
+                break
+            matched = chunk.end
+        return matched
+
     def load_restore_plan(
         self,
         plan: DiskPromptCacheRestorePlan,

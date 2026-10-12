@@ -159,6 +159,7 @@ def test_insert_reports_full_prepared_prompt_length(monkeypatch):
             image_spans=[],
         ),
         restored=None,
+        matched_tokens=None,
     )
     kit = object.__new__(BatchedVisionModelKit)
     kit._shutdown = SimpleNamespace(is_set=lambda: True)
@@ -403,6 +404,7 @@ def test_request_admission_builds_and_passes_prefill_plan_once(monkeypatch):
             image_spans=[],
         ),
         restored=None,
+        matched_tokens=None,
     )
     active = {}
 
@@ -430,6 +432,7 @@ def test_request_admission_rejects_oversized_prepared_prompt_without_insert():
             image_spans=[],
         ),
         restored=None,
+        matched_tokens=None,
     )
 
     kit._insert_prepared_request(

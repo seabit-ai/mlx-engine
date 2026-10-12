@@ -350,3 +350,32 @@ def test_cache_store_rotating_restore_uses_target_window(cache_store):
     assert restore_plan is not None
     loaded = cache_store.load_restore_plan(restore_plan)
     _assert_rotating_restore(loaded)
+
+
+def test_matched_prefix_tokens_reports_token_identity_depth(cache_store):
+    prompt_input_ids = list(range(1200))  # four full 256-token chunks
+    chunks = build_prefix_cache_chunks(prompt_input_ids, [])
+    for chunk in chunks[:4]:
+        _save_chunk(
+            cache_store,
+            chunk,
+            chunks,
+            _prompt_cache(chunk.end),
+            save_state_checkpoint=chunk.end == 512,
+        )
+
+    # Token identity runs to the last indexed chunk, past the last checkpoint;
+    # the restore plan snaps back to the checkpointed boundary.
+    assert cache_store.matched_prefix_tokens(prompt_input_ids, []) == 1024
+    plan = cache_store.plan_longest_prefix_restore(prompt_input_ids, [])
+    assert plan is not None
+    assert plan.cached_prefix_len == 512
+
+    # A prompt that diverges inside chunk 2 matches only chunk 1: the gap
+    # between matched and prompt length names the divergence offset.
+    divergent = prompt_input_ids[:300] + [9999] + prompt_input_ids[301:]
+    assert cache_store.matched_prefix_tokens(divergent, []) == 256
+
+
+def test_matched_prefix_tokens_is_zero_without_a_layout(cache_store):
+    assert cache_store.matched_prefix_tokens(list(range(600)), []) == 0

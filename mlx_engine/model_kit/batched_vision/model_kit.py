@@ -506,10 +506,20 @@ class BatchedVisionModelKit:
             prompt_input_ids=prepared_prompt.prompt_input_ids,
             image_spans=prepared_prompt.image_spans,
         )
+        matched_tokens = None
+        try:
+            matched_tokens = self._prompt_cache_store.matched_prefix_tokens(
+                prepared_prompt.prompt_input_ids,
+                prepared_prompt.image_spans,
+            )
+        except Exception:
+            # The match probe is diagnostics only; a restore must not fail on it.
+            logger.debug("Prompt cache match probe failed.", exc_info=True)
         return PreparedInsert(
             request=request,
             prepared_prompt=prepared_prompt,
             restored=restored,
+            matched_tokens=matched_tokens,
         )
 
     def _insert_prepared_request(
@@ -626,6 +636,7 @@ class BatchedVisionModelKit:
             restore_source="none" if restored is None else restored.source,
             restored_tokens=cached_prefix_len,
             hot_trimmed_tokens=0 if restored is None else restored.trimmed_tokens,
+            matched_tokens=prepared_insert.matched_tokens,
         )
         targets = getattr(request, "context_check_targets", None)
         if targets is not None and not prepared_prompt.image_spans:

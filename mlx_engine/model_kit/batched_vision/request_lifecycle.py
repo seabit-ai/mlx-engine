@@ -43,6 +43,7 @@ class PreparedInsert:
     request: GenerationRequest
     prepared_prompt: PreparedPrompt
     restored: RestoredPromptCache | None
+    matched_tokens: int | None = None  # indexed-chunk token match, checkpoints ignored; None = probe failed
 
 
 @dataclass
