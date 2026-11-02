@@ -11,6 +11,9 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
+from mlx_engine.model_kit.patches.rotating_sink_mask import (
+    apply_rotating_sink_mask_patch,
+)
 
 from mlx_engine.utils.prompt_progress_reporter import (
     PromptProgressReporter,
@@ -77,7 +80,9 @@ class CacheWrapper:
         return self._live_cache
 
     def _make_cache(self) -> List[Any]:
-        cache = make_prompt_cache(self.model, self._max_kv_size)
+        cache = apply_rotating_sink_mask_patch(
+            make_prompt_cache(self.model, self._max_kv_size)
+        )
         if self._draft_model is not None:
             cache += make_prompt_cache(self._draft_model)
         return cache
