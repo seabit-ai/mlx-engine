@@ -21,7 +21,13 @@ from mlx_engine.utils.prompt_progress_reporter import (
 )
 
 
-PROMPT_PROCESSING_CHUNK_SIZE = 2048
+# 512, not mlx-lm's 2048. The batched generator runs one decode step per prefill chunk, so the
+# chunk is the gap every other request feels while a long prompt is read (Qwen3.8-27B-4bit, 30k
+# prompt: 6.7 s per token at 2048, 1.8 s at 512) and the per-chunk attention working set (peak
+# -4.7 GB at 50k, fp16 and kv8 alike). Prefill time: 27B within 1%; gemma-4 E4B +9-11% at 30k+.
+# Measured: lmk research/2026-11-01-sink-mask-review exp02-05 (SMR-010..013); decided in
+# lmk docs/design/2026-11-01-prefill-chunk.md.
+PROMPT_PROCESSING_CHUNK_SIZE = 512
 
 # Checkpoint N tokens before end of prompt
 # This value is at parity with mlx-lm:
